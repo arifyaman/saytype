@@ -19,6 +19,9 @@ typing" listed as next iteration).
   pipeline knows when speech is live without waiting for the pause.
 - The typing layer (ydotool) can already send arbitrary key events, including
   `BackSpace`, which is all that "correction" requires.
+- Prerequisite: the **streaming Zipformer backend** must be active. A
+  Moonshine v2 model dir in `models/` is preferred by `asr.rs` and is
+  batch-only, so for mvp2 it must be removed (or backend selection added).
 
 ## What the user will see
 

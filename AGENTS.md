@@ -13,7 +13,7 @@ focus-free HUD pill (recording state + transcript) while dictating.
 
 Pipeline per dictation session:
 
-    PipeWire mic capture -> Silero VAD -> sherpa-onnx streaming Zipformer (EN) -> ydotool typing
+    PipeWire mic capture -> Silero VAD -> sherpa-onnx ASR (Moonshine v2 or streaming Zipformer, EN) -> ydotool typing
 
 ## Processes and IPC
 
@@ -39,10 +39,10 @@ Pipeline per dictation session:
 | `src/daemon.rs` | D-Bus service, `Engine` state machine (Idle/Recording), per-session pipeline tasks (`vad_task`, `asr_task`, `injector_task`) |
 | `src/audio.rs` | PipeWire capture on a dedicated OS thread; S16LE 16 kHz mono in, f32 frames out via mpsc |
 | `src/vad.rs` | Silero VAD wrapper, `VadParams` defaults, `AudioRing` context-padding buffer + unit tests |
-| `src/asr.rs` | `Asr` (sherpa-onnx `OnlineRecognizer`), model auto-detection, batch `transcribe()` |
+| `src/asr.rs` | `Asr` dual backend (Moonshine `OfflineRecognizer` preferred, streaming Zipformer `OnlineRecognizer` fallback), model auto-detection, batch `transcribe()` |
 | `src/injector.rs` | ydotool typing (`type_text`), `capitalize_first` MVP punctuation stand-in + test |
-| `extension/saytype@saytype.local/` | GNOME Shell extension HUD (gjs): D-Bus client, top-center pill, `metadata.json` + `stylesheet.css` |
-| `models/` | `silero_vad.onnx` + `sherpa-onnx-streaming-zipformer-*` (gitignored; `scripts/download-models.sh`) |
+| `extension/saytype@saytype.local/` | GNOME Shell extension HUD (gjs, ESM-first): D-Bus proxy client, top-center pill (inline St styles, emoji mic), `metadata.json` |
+| `models/` | `silero_vad.onnx` + ASR model dirs (Moonshine v2 preferred, streaming zipformer fallback; gitignored; `scripts/download-models.sh`) |
 | `systemd/saytype.service` | Unit template with `@REPO@`/`@BIN@` placeholders |
 | `scripts/setup-ydotool.sh` | One-time: apt ydotool, udev rule for `/dev/uinput`, `ydotoold` user service |
 | `scripts/download-models.sh` | Downloads the VAD + Zipformer models into `models/` |
@@ -78,22 +78,57 @@ may rely on that order.
    from the `AudioRing` (raw audio, absolute sample indexes): 300 ms pre /
    800 ms post (`PRE_PAD_MS`/`POST_PAD_MS` in vad.rs). Do not "simplify" the
    ring away.
-4. **ASR is batch-per-segment in v1**: fresh `OnlineStream`, feed the whole
-   padded segment, `input_finished()`, decode loop, `get_result()`.
-   `enable_endpoint = false`, greedy search, 4 threads, CPU provider.
-5. **Models are auto-detected, not hardcoded.** `asr.rs` scans `models/` for a
-   `sherpa-onnx-streaming-zipformer-*` dir containing encoder/decoder/joiner
-   `*epoch*.onnx` + `tokens.txt`, preferring the non-int8 variants.
+4. **ASR is batch-per-segment in v1 (no live partials).** Zipformer path:
+   fresh `OnlineStream`, feed the whole padded segment, `input_finished()`,
+   decode loop, `get_result()`, `enable_endpoint = false`, greedy search.
+   Moonshine path: fresh offline stream, feed the segment, single
+   `decode()`, `get_result()`. Both: CPU provider, thread count from config.
+5. **Models are auto-detected, not hardcoded.** `asr.rs` scans `models/` and
+   prefers a **Moonshine v2** dir (`encoder_model.*` + `decoder_model_merged.*`
+   as `.onnx`/`.ort` + `tokens.txt`, 16 kHz input) over a
+   `sherpa-onnx-streaming-zipformer-*` dir (encoder/decoder/joiner
+   `*epoch*.onnx` + `tokens.txt`, non-int8 variants preferred). Both can
+   coexist; remove one dir to switch. Only the zipformer backend can produce
+   live partials (mvp2); Moonshine is batch-per-segment but outputs proper
+   casing and punctuation.
 6. **The HUD is a GNOME Shell extension, not a process.** It runs inside
    gnome-shell (gjs). Keep it small and defensive: a JS fault there can take
-   the whole shell down. gnome-shell 46 does **not** hot-load new user
-   extensions - after installing, restart the shell (log out/in, or Alt+F2
-   `r` on X11) once. The extension only consumes the D-Bus signals; do not add
+   the whole shell down. The shell does **not** hot-load changed user
+   extensions - after installing or changing the JS, restart the shell (log
+   out/in, or Alt+F2 `r` on X11; the restart is in-process, so the shell PID
+   stays the same). The extension only consumes the D-Bus signals; do not add
    side channels.
-7. **Build env**: `.cargo/config.toml` sets `LIBCLANG_PATH` and
+7. **GNOME 46's ESM GJS bindings expose a reduced, differently-named API
+   surface.** Do not copy API calls from generic GJS docs or pre-45
+   extensions; verify each against the shell's own code
+   (`strings /usr/lib/gnome-shell/libshell-14.so`) or a known-good 46
+   extension (gnome-shell-extensions repo, speech2text-extension). Hard-won
+   specifics:
+   - The St typelib (`/usr/lib/gnome-shell/St-14.typelib`) is **curated**:
+     `St.Label` has only `text`/`clutter_text` (no `set_ellipsize` /
+     `set_max_width_chars` - use `label.clutter_text.ellipsize = ...` plus CSS
+     `max-width`); no `add_actor` (use `add_child`); no `set_visible` /
+     `get_visible` (use `hide()` / `show()`); no `new_animation` with
+     `autoreverse` / `loop` (use `.ease({...})` + a repeating
+     `GLib.timeout_add` returning `true`).
+   - GI keeps C snake_case for statics (`Gio.DBusConnection.get_default()`,
+     not `getDefault()`).
+   - D-Bus: use `Gio.DBusProxy.makeProxyWrapper(XML)` +
+     `new Proxy(Gio.DBus.session, busName, objectPath)` +
+     `proxy.connectSignal(name, (p, sender, [args]) => ...)` +
+     `proxy.MethodAsync()`. Raw `signal_subscribe` takes a different arg
+     order than the C API in this build (sender, interface, member, path,
+     rule, flags, cb).
+   - `Main.panel` is a JS class: its C-base signals can't be connected from
+     extensions (use `global.display.connect('workareas-changed', ...)`);
+     reading `Main.panel.height` is fine.
+   - Chrome registration: `Main.layoutManager.addTopChrome(actor)` /
+     `Main.layoutManager.removeChrome(actor)`; source removal via
+     `GLib.Source.remove(id)`. Inline `style:` on St actors works.
+8. **Build env**: `.cargo/config.toml` sets `LIBCLANG_PATH` and
    `BINDGEN_EXTRA_CLANG_ARGS` (bindgen needs them for the pipewire/sherpa-onnx
    crates). Non-interactive shells don't have `~/.cargo/bin` on PATH.
-8. **Audio source matters.** The system default input must be the real
+9. **Audio source matters.** The system default input must be the real
    microphone (on this machine: UMC202HD, mic on the left channel). A wrong
    default (e.g. a webcam's IEC958 line) yields garbage. Check with
    `wpctl status` / set with `wpctl set-default <node>`.
@@ -109,6 +144,10 @@ scripts/install-user-service.sh   # build + install + enable the user service
 scripts/install-extension.sh      # install + enable the HUD extension
 journalctl --user -u saytype -f   # live daemon logs
 ~/.local/bin/saytype-toggle       # what the GNOME hotkey calls
+
+# HUD extension: syntax-check, redeploy, then restart the shell to reload
+node --check extension/saytype@saytype.local/extension.js
+scripts/install-extension.sh      # Alt+F2 -> r (X11) or log out/in afterwards
 
 # watch the D-Bus signals directly (handy when the journal is noisy)
 gdbus monitor --session --dest io.saytype.Dictate --object-path /io/saytype/Dictate
