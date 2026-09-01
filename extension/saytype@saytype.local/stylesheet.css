@@ -1,0 +1,17 @@
+.saytype-pill {
+    background-color: rgba(24, 26, 32, 0.92);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    border-radius: 24px;
+    padding: 10px 22px;
+    spacing: 10px;
+}
+
+.saytype-pill-text {
+    color: #f2f2f7;
+    font-size: 15px;
+    font-weight: 500;
+}
+
+.saytype-mic {
+    color: #ff5c57;
+}

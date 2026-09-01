@@ -1,0 +1,15 @@
+# Build artifacts
+/target
+
+# ASR/VAD models (~330 MB) - fetch with scripts/download-models.sh
+models/*
+!models/.gitkeep
+
+# Local test recordings
+*.wav
+
+# Editor / OS noise
+*~
+.DS_Store
+.idea/
+.vscode/

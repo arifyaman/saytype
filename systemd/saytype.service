@@ -1,0 +1,17 @@
+[Unit]
+Description=SayType speech-to-text dictation daemon
+Documentation=https://github.com/
+After=pipewire.service sound.target
+Wants=sound.target
+
+[Service]
+Type=simple
+WorkingDirectory=@REPO@
+Environment=SAYTYPE_MODELS_DIR=@REPO@/models
+Environment=RUST_LOG=saytype=info
+ExecStart=@BIN@
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target

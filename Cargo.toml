@@ -1,0 +1,23 @@
+[package]
+name = "saytype"
+version = "0.1.0"
+edition = "2021"
+description = "Background speech-to-text dictation daemon for GNOME"
+license = "MIT"
+
+[[bin]]
+name = "saytype"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "process"] }
+zbus = "4.4"
+pipewire = { version = "0.10", features = ["v1_0_0"] }
+sherpa-onnx = "1.13"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1"
+
+[profile.release]
+lto = true
+codegen-units = 1

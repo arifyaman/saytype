@@ -1,0 +1,7 @@
+{
+  "uuid": "saytype@saytype.local",
+  "name": "SayType HUD",
+  "description": "Focus-free dictation HUD for the saytype background dictation daemon",
+  "version": "0.1.0",
+  "shell-version": ["46"]
+}

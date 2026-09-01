@@ -1,0 +1,5 @@
+[env]
+LIBCLANG_PATH = "/usr/lib/llvm-18/lib"
+# clang (bindgen) does not search the GCC include dir for stdbool.h/stddef.h/
+# stdarg.h, so point it at the system GCC headers.
+BINDGEN_EXTRA_CLANG_ARGS = "-isystem /usr/lib/gcc/x86_64-linux-gnu/13/include"

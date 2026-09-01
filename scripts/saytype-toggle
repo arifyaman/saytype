@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# saytype-toggle: toggle the dictation session.
+# Bind this to a GNOME custom shortcut (Settings -> Keyboard -> Custom Shortcuts).
+exec dbus-send --session --dest=io.saytype.Dictate --type=method_call \
+  /io/saytype/Dictate io.saytype.Dictate1.Toggle
