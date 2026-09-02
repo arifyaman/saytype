@@ -1,8 +1,10 @@
 // SayType HUD - focus-free dictation overlay for the saytype daemon.
 //
-// Draws a pill below the top panel while dictation is active. It is a
-// Clutter actor on the shell stage, not a window, so it never steals focus
-// and works the same on X11 and Wayland sessions. All state arrives over
+// While dictation is active it draws a dim overlay across all monitors and
+// a pill near the mouse pointer (which it tracks), so the HUD is visible on
+// any screen in a multi-monitor setup. It is a Clutter actor on the shell
+// stage, not a window, so it never steals focus and works the same on X11
+// and Wayland sessions. All state arrives over
 // the session bus:
 //
 //   io.saytype.Dictate / io.saytype.Dictate1
@@ -50,9 +52,12 @@ const SayTypeInterface = `
 const SayTypeProxy = Gio.DBusProxy.makeProxyWrapper(SayTypeInterface);
 
 const MAX_TEXT_WIDTH_PX = 560;
-const PILL_TOP_GAP = 12;
+const CURSOR_GAP = 28; // pill offset from the pointer, below it
+const EDGE_MARGIN = 8; // keep the pill off the monitor edges
+const TRACK_INTERVAL_MS = 120; // pointer tracking cadence while recording
 const IDLE_LABEL = 'Listening\u2026';
 const MIC_TEXT = '\u{1F3A4}'; // microphones
+const OVERLAY_STYLE = 'background-color: rgba(0, 0, 0, 0.35);';
 
 const PILL_STYLE = `
   background-color: rgba(28, 28, 30, 0.94);
@@ -77,8 +82,9 @@ SayTypeHUD.prototype = {
     this._proxy = null;
     this._conns = [];
     this._nameConn = 0;
-    this._panelAllocId = 0;
+    this._layoutConnId = 0;
     this._repositionId = 0;
+    this._trackId = 0;
     this._pulseId = 0;
     this._pulseDimmed = false;
     this._text = '';
@@ -110,12 +116,28 @@ SayTypeHUD.prototype = {
       return Clutter.EVENT_STOP;
     });
 
+    // Full-screen dim shown while recording. Non-reactive so it never
+    // blocks mouse or keyboard input; it is only a visual cue. Added to
+    // top chrome BEFORE the pill so the pill (added later) draws on top.
+    // St.Actor is not in this build's curated St typelib, so use
+    // St.Widget, as the shell itself does for its own stage actors.
+    this._overlay = new St.Widget({
+      style: OVERLAY_STYLE,
+      reactive: false,
+    });
+    this._overlay.hide();
+    Main.layoutManager.addTopChrome(this._overlay);
+
     Main.layoutManager.addTopChrome(this._pill);
+    this._layoutOverlay();
     // Follow the panel on monitor / workarea changes. Main.panel is a JS
     // class without C-signal connectivity from here, so use the display's
     // workareas-changed signal (the shell's own Panel does the same).
-    this._panelAllocId = global.display.connect('workareas-changed',
-      () => this._queueReposition());
+    this._layoutConnId = global.display.connect('workareas-changed',
+      () => {
+        this._layoutOverlay();
+        this._queueReposition();
+      });
 
     this._initDBus();
   },
@@ -164,14 +186,18 @@ SayTypeHUD.prototype = {
         }
       }
     }
-    if (this._panelAllocId)
-      global.display.disconnect(this._panelAllocId);
+    if (this._layoutConnId)
+      global.display.disconnect(this._layoutConnId);
     if (this._repositionId)
       GLib.Source.remove(this._repositionId);
     this._stopPulse();
+    this._stopTracking();
     if (this._pill.get_parent())
       Main.layoutManager.removeChrome(this._pill);
     this._pill.destroy();
+    if (this._overlay.get_parent())
+      Main.layoutManager.removeChrome(this._overlay);
+    this._overlay.destroy();
   },
 
   _setState(recording) {
@@ -181,12 +207,17 @@ SayTypeHUD.prototype = {
     this._text = '';
     this._updateLabel();
     if (recording) {
+      this._layoutOverlay();
+      this._overlay.show();
       this._pill.show();
       this._startPulse();
+      this._startTracking();
       this._queueReposition();
     } else {
+      this._overlay.hide();
       this._pill.hide();
       this._stopPulse();
+      this._stopTracking();
     }
   },
 
@@ -202,17 +233,63 @@ SayTypeHUD.prototype = {
     this._label.set_text(this._text || IDLE_LABEL);
   },
 
+  _layoutOverlay() {
+    const mons = Main.layoutManager.monitors;
+    if (!mons.length)
+      return;
+    let minX = Infinity;
+    let minY = Infinity;
+    let maxX = -Infinity;
+    let maxY = -Infinity;
+    for (const m of mons) {
+      minX = Math.min(minX, m.x);
+      minY = Math.min(minY, m.y);
+      maxX = Math.max(maxX, m.x + m.width);
+      maxY = Math.max(maxY, m.y + m.height);
+    }
+    this._overlay.set_position(Math.round(minX), Math.round(minY));
+    this._overlay.set_size(Math.round(maxX - minX), Math.round(maxY - minY));
+  },
+
+  // Place the pill near the pointer, on the monitor that contains it, so a
+  // multi-monitor user always sees it on the screen they are working on.
   _reposition() {
     if (!this._recording)
       return;
-    const mon = Main.layoutManager.primaryMonitor;
-    let [w] = this._pill.get_size();
+    const [px, py] = global.get_pointer();
+    let mon = Main.layoutManager.monitors.find(m =>
+      px >= m.x && px < m.x + m.width &&
+      py >= m.y && py < m.y + m.height);
+    if (!mon)
+      mon = Main.layoutManager.primaryMonitor;
+    let [w, h] = this._pill.get_size();
     if (!w)
-      w = 200;
-    const panelH = Main.panel ? Main.panel.height : 32;
-    const x = Math.round(mon.x + (mon.width - w) / 2);
-    const y = Math.round(mon.y + panelH + PILL_TOP_GAP);
-    this._pill.set_position(x, y);
+      [w, h] = [200, 40];
+    let x = Math.round(px - w / 2);
+    x = Math.max(mon.x + EDGE_MARGIN,
+      Math.min(x, mon.x + mon.width - w - EDGE_MARGIN));
+    let y = py + CURSOR_GAP;
+    if (y + h > mon.y + mon.height - EDGE_MARGIN)
+      y = py - CURSOR_GAP - h;
+    y = Math.max(mon.y + EDGE_MARGIN,
+      Math.min(y, mon.y + mon.height - h - EDGE_MARGIN));
+    this._pill.set_position(Math.round(x), Math.round(y));
+  },
+
+  _startTracking() {
+    this._stopTracking();
+    this._trackId = GLib.timeout_add(GLib.PRIORITY_DEFAULT,
+      TRACK_INTERVAL_MS, () => {
+        this._reposition();
+        return true;
+      });
+  },
+
+  _stopTracking() {
+    if (this._trackId) {
+      GLib.Source.remove(this._trackId);
+      this._trackId = 0;
+    }
   },
 
   _queueReposition() {
