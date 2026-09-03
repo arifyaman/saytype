@@ -1,56 +1,191 @@
 //! ASR backend.
 //!
-//! Two model families are supported behind one interface, auto-detected from
-//! `models/`:
+//! Three model families are supported behind one interface, selected from
+//! `models/` and a `BackendSelection`:
 //!
-//! - **Moonshine v2** (preferred when present): a
-//!   `sherpa-onnx-moonshine-*` dir with `encoder_model.*` +
-//!   `decoder_model_merged.*` (`.onnx` or `.ort`) + `tokens.txt`. Runs as an
-//!   `OfflineRecognizer` - batch per finalized segment. Outputs proper casing
-//!   and punctuation.
-//! - **Streaming Zipformer** (fallback): a `sherpa-onnx-streaming-zipformer-*`
-//!   dir with encoder/decoder/joiner `*epoch*.onnx` + `tokens.txt`. Runs as an
-//!   `OnlineRecognizer`; this is the only backend that can produce live
-//!   partials (required for mvp2 live typing).
+//! - **Nemotron Speech Streaming EN 0.6B** (mvp2 default): a
+//!   `sherpa-onnx-nemotron-speech-streaming-en-*` dir with
+//!   encoder/decoder/joiner `*.onnx` + `tokens.txt`. Runs as an
+//!   `OnlineRecognizer` with `model_type = "nemo_transducer"` (cache-aware
+//!   FastConformer + RNNT). Trained on ~530k h of audio; emits live
+//!   partials and natively cased, punctuated text.
+//! - **Streaming Zipformer**: a `sherpa-onnx-streaming-zipformer-*` dir
+//!   with encoder/decoder/joiner `*epoch*.onnx` + `tokens.txt`. Runs as an
+//!   `OnlineRecognizer`; also produces live partials. Its raw output is
+//!   all-caps and unpunctuated, so it is post-processed (see below).
+//! - **Moonshine v2**: a `sherpa-onnx-moonshine-*` dir with
+//!   `encoder_model.*` + `decoder_model_merged.*` (`.onnx` or `.ort`) +
+//!   `tokens.txt`. Runs as an `OfflineRecognizer` - batch per finalized
+//!   segment. Outputs proper casing and punctuation. Cannot produce live
+//!   partials (offline model).
 //!
-//! Both models can coexist in `models/`; Moonshine wins. Remove its directory
-//! (or the zipformer one) to switch.
+//! All model dirs can coexist in `models/`. `BackendSelection::Auto`
+//! prefers Nemotron, then Zipformer, then Moonshine (the mvp2 default is
+//! the Nemotron streaming backend); `Streaming` picks the best streaming
+//! backend (Nemotron over Zipformer); `Zipformer`/`Moonshine` force a
+//! backend and error when its model dir is missing.
+//!
+//! **Punctuation/casing** (streaming path only): an optional
+//! `sherpa-onnx-online-punct-*` dir (`model.int8.onnx`/`model.onnx` +
+//! `bpe.vocab`) is auto-detected. Zipformer output (all-caps) is always
+//! lowercased and run through the `OnlinePunctuation` model when present.
+//! Nemotron output is natively cased/punctuated; it is lowercased + run
+//! through the punct model when present (denser punctuation), and left
+//! native otherwise. Moonshine output is never post-processed.
 
 use anyhow::{bail, Context, Result};
 use sherpa_onnx::{
-    OfflineRecognizer, OfflineRecognizerConfig, OnlineRecognizer, OnlineRecognizerConfig,
+    OfflineRecognizer, OfflineRecognizerConfig, OnlinePunctuation, OnlinePunctuationConfig,
+    OnlinePunctuationModelConfig, OnlineRecognizer, OnlineRecognizerConfig, OnlineStream,
 };
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 const SAMPLE_RATE: i32 = 16000;
 
+/// Which ASR backend to load. `Auto` prefers Nemotron streaming, then
+/// Zipformer streaming, then Moonshine (the mvp2 default is the Nemotron
+/// streaming backend); `Streaming` picks the best streaming backend
+/// (Nemotron over Zipformer); the explicit variants force a backend and
+/// error when its model dir is missing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackendSelection {
+    Auto,
+    Streaming,
+    Zipformer,
+    Moonshine,
+}
+
+/// Which backend a loaded `Asr` actually uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AsrKind {
+    Nemotron,
+    Zipformer,
+    Moonshine,
+}
+
 pub struct Asr {
     backend: Backend,
+    /// Online punctuation/casing model (streaming backends only). `None`
+    /// when the model dir is absent; see the module docs for how that
+    /// affects each backend's output.
+    punct: Option<OnlinePunctuation>,
 }
 
 enum Backend {
-    Streaming(OnlineRecognizer),
+    Nemotron(OnlineRecognizer),
+    Zipformer(OnlineRecognizer),
     Moonshine(OfflineRecognizer),
 }
 
 impl Asr {
-    pub fn new(models_dir: &Path, num_threads: i32) -> Result<Self> {
-        if let Some(paths) = Self::find_moonshine(models_dir) {
-            tracing::info!("ASR backend: moonshine v2 in {:?}", paths.dir);
-            let mut config = OfflineRecognizerConfig::default();
-            config.model_config.moonshine.encoder = Some(paths.encoder);
-            config.model_config.moonshine.merged_decoder = Some(paths.merged_decoder);
-            config.model_config.tokens = Some(paths.tokens);
-            config.model_config.num_threads = num_threads;
-            config.model_config.provider = Some("cpu".to_string());
-            let recognizer = OfflineRecognizer::create(&config)
-                .context("failed to create Moonshine OfflineRecognizer (check model files)")?;
-            return Ok(Self {
-                backend: Backend::Moonshine(recognizer),
-            });
-        }
+    pub fn new(models_dir: &Path, num_threads: i32, selection: BackendSelection) -> Result<Self> {
+        // mvp2 default: streaming first (it alone can produce live
+        // partials); Nemotron is preferred over Zipformer; Moonshine stays
+        // as the batch fallback.
+        let backend = match selection {
+            BackendSelection::Auto => match Self::create_nemotron(models_dir, num_threads) {
+                Ok(b) => b,
+                Err(e) => {
+                    tracing::info!("no usable Nemotron streaming model ({e}); trying Zipformer");
+                    match Self::create_zipformer(models_dir, num_threads) {
+                        Ok(b) => b,
+                        Err(e2) => {
+                            tracing::info!("no usable streaming Zipformer model ({e2}); trying Moonshine");
+                            Self::create_moonshine(models_dir, num_threads)?
+                        }
+                    }
+                }
+            },
+            BackendSelection::Streaming => match Self::create_nemotron(models_dir, num_threads) {
+                Ok(b) => b,
+                Err(e) => {
+                    tracing::info!("no usable Nemotron streaming model ({e}); falling back to Zipformer");
+                    Self::create_zipformer(models_dir, num_threads)?
+                }
+            },
+            BackendSelection::Zipformer => Self::create_zipformer(models_dir, num_threads)?,
+            BackendSelection::Moonshine => Self::create_moonshine(models_dir, num_threads)?,
+        };
+        // The punct model is only useful for streaming backends.
+        let punct = match &backend {
+            Backend::Nemotron(_) | Backend::Zipformer(_) => Self::create_punct(models_dir, num_threads),
+            Backend::Moonshine(_) => None,
+        };
+        Ok(Self { backend, punct })
+    }
 
+    pub fn kind(&self) -> AsrKind {
+        match &self.backend {
+            Backend::Nemotron(_) => AsrKind::Nemotron,
+            Backend::Zipformer(_) => AsrKind::Zipformer,
+            Backend::Moonshine(_) => AsrKind::Moonshine,
+        }
+    }
+
+    /// True for the backends that produce live partials.
+    pub fn is_streaming(&self) -> bool {
+        matches!(self.kind(), AsrKind::Nemotron | AsrKind::Zipformer)
+    }
+
+    /// A live streaming session, present only for the streaming backends.
+    /// The session borrows the shared recognizer and the optional punctuation
+    /// model, and owns its own `OnlineStream`. `normalize` marks backends
+    /// whose raw output must always be lowercased (Zipformer: all-caps);
+    /// backends with native casing (Nemotron) are only polished when the
+    /// punct model is available.
+    pub fn streaming_session(&self) -> Option<StreamingSession<'_>> {
+        match &self.backend {
+            Backend::Nemotron(recognizer) => {
+                Some(StreamingSession::new(recognizer, self.punct.as_ref(), false))
+            }
+            Backend::Zipformer(recognizer) => {
+                Some(StreamingSession::new(recognizer, self.punct.as_ref(), true))
+            }
+            Backend::Moonshine(_) => None,
+        }
+    }
+
+    fn create_moonshine(models_dir: &Path, num_threads: i32) -> Result<Backend> {
+        let paths = Self::find_moonshine(models_dir).with_context(|| {
+            format!("no Moonshine model found under {:?} (a sherpa-onnx-moonshine-* dir with encoder_model.*, decoder_model_merged.*, tokens.txt)", models_dir)
+        })?;
+        tracing::info!("ASR backend: moonshine v2 in {:?}", paths.dir);
+        let mut config = OfflineRecognizerConfig::default();
+        config.model_config.moonshine.encoder = Some(paths.encoder);
+        config.model_config.moonshine.merged_decoder = Some(paths.merged_decoder);
+        config.model_config.tokens = Some(paths.tokens);
+        config.model_config.num_threads = num_threads;
+        config.model_config.provider = Some("cpu".to_string());
+        let recognizer = OfflineRecognizer::create(&config)
+            .context("failed to create Moonshine OfflineRecognizer (check model files)")?;
+        Ok(Backend::Moonshine(recognizer))
+    }
+
+    fn create_nemotron(models_dir: &Path, num_threads: i32) -> Result<Backend> {
+        let paths = Self::find_nemotron(models_dir).with_context(|| {
+            format!("no Nemotron streaming model found under {:?} (a sherpa-onnx-nemotron-speech-streaming-en-* dir with encoder/decoder/joiner *.onnx + tokens.txt)", models_dir)
+        })?;
+        tracing::info!("ASR backend: nemotron speech streaming (en 0.6b) in {:?}", paths.dir);
+        let mut config = OnlineRecognizerConfig::default();
+        config.model_config.transducer.encoder = Some(paths.encoder);
+        config.model_config.transducer.decoder = Some(paths.decoder);
+        config.model_config.transducer.joiner = Some(paths.joiner);
+        config.model_config.tokens = Some(paths.tokens);
+        config.model_config.num_threads = num_threads;
+        config.model_config.provider = Some("cpu".to_string());
+        // Cache-aware FastConformer + RNNT (NVIDIA NeMo export layout).
+        config.model_config.model_type = Some("nemo_transducer".to_string());
+        config.decoding_method = Some("greedy_search".to_string());
+        // Endpointing stays off: VAD finalization is the commit boundary.
+        config.enable_endpoint = false;
+
+        let recognizer = OnlineRecognizer::create(&config)
+            .context("failed to create Nemotron OnlineRecognizer (check model files)")?;
+        Ok(Backend::Nemotron(recognizer))
+    }
+
+    fn create_zipformer(models_dir: &Path, num_threads: i32) -> Result<Backend> {
         let paths = Self::resolve_zipformer_paths(models_dir)?;
         tracing::info!("ASR backend: streaming zipformer in {:?}", paths.dir);
         let mut config = OnlineRecognizerConfig::default();
@@ -61,13 +196,41 @@ impl Asr {
         config.model_config.num_threads = num_threads;
         config.model_config.provider = Some("cpu".to_string());
         config.decoding_method = Some("greedy_search".to_string());
+        // Endpointing stays off: VAD finalization is the commit boundary.
         config.enable_endpoint = false;
 
         let recognizer = OnlineRecognizer::create(&config)
-            .context("failed to create OnlineRecognizer (check model files)")?;
-        Ok(Self {
-            backend: Backend::Streaming(recognizer),
-        })
+            .context("failed to create Zipformer OnlineRecognizer (check model files)")?;
+        Ok(Backend::Zipformer(recognizer))
+    }
+
+    /// Load the optional online punctuation/casing model. Returns `None`
+    /// (with a warning) when the model dir is absent - the streaming path
+    /// still works, it just emits lowercased text without punctuation.
+    fn create_punct(models_dir: &Path, num_threads: i32) -> Option<OnlinePunctuation> {
+        let Some(paths) = Self::find_online_punct(models_dir) else {
+            tracing::warn!(
+                "no online punctuation model under {:?} (a sherpa-onnx-online-punct-* dir \
+                 with model.int8.onnx + bpe.vocab); streaming output will be lowercased \
+                 but unpunctuated. Run scripts/download-models.sh to add it.",
+                models_dir
+            );
+            return None;
+        };
+        tracing::info!(
+            "online punctuation model in {:?} ({})",
+            paths.dir,
+            if paths.model.contains("int8") { "int8" } else { "fp32" }
+        );
+        let config = OnlinePunctuationConfig {
+            model: OnlinePunctuationModelConfig {
+                cnn_bilstm: Some(paths.model),
+                bpe_vocab: Some(paths.vocab),
+                num_threads,
+                ..Default::default()
+            },
+        };
+        OnlinePunctuation::create(&config)
     }
 
     /// Find a Moonshine v2 model dir: `encoder_model*` +
@@ -152,10 +315,96 @@ impl Asr {
         )
     }
 
+    /// Find the optional online punctuation model dir: a
+    /// `sherpa-onnx-online-punct-*` dir with a `bpe.vocab` and a
+    /// `model.int8.onnx` (preferred) or `model.onnx`.
+    fn find_online_punct(models_dir: &Path) -> Option<PunctPaths> {
+        let mut dirs: Vec<PathBuf> = std::fs::read_dir(models_dir)
+            .ok()?
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| {
+                p.is_dir()
+                    && p.file_name()
+                        .map(|n| {
+                            n.to_string_lossy().starts_with("sherpa-onnx-online-punct")
+                        })
+                        .unwrap_or(false)
+            })
+            .collect();
+        dirs.sort();
+
+        for dir in &dirs {
+            let vocab = dir.join("bpe.vocab");
+            if !vocab.is_file() {
+                continue;
+            }
+            // Prefer the int8 model (smaller, equally fast here); fall back
+            // to the fp32 one.
+            let model = ["model.int8.onnx", "model.onnx"]
+                .iter()
+                .map(|name| dir.join(name))
+                .find(|p| p.is_file());
+            let Some(model) = model else {
+                continue;
+            };
+            return Some(PunctPaths {
+                dir: dir.clone(),
+                model: model.to_string_lossy().into(),
+                vocab: vocab.to_string_lossy().into(),
+            });
+        }
+        None
+    }
+
+    /// Find the Nemotron streaming (English) model dir: a
+    /// `sherpa-onnx-nemotron-speech-streaming-en-*` dir with
+    /// encoder/decoder/joiner ONNX files + `tokens.txt`.
+    fn find_nemotron(models_dir: &Path) -> Option<NemotronPaths> {
+        let mut dirs: Vec<PathBuf> = std::fs::read_dir(models_dir)
+            .ok()?
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| {
+                p.is_dir()
+                    && p.file_name()
+                        .map(|n| {
+                            n.to_string_lossy()
+                                .starts_with("sherpa-onnx-nemotron-speech-streaming-en")
+                        })
+                        .unwrap_or(false)
+            })
+            .collect();
+        dirs.sort();
+
+        for dir in &dirs {
+            let Some(encoder) = find_onnx_preferring_int8(dir, "encoder") else {
+                continue;
+            };
+            let Some(decoder) = find_onnx_preferring_int8(dir, "decoder") else {
+                continue;
+            };
+            let Some(joiner) = find_onnx_preferring_int8(dir, "joiner") else {
+                continue;
+            };
+            let tokens = dir.join("tokens.txt");
+            if tokens.is_file() {
+                return Some(NemotronPaths {
+                    dir: dir.clone(),
+                    encoder: encoder.to_string_lossy().into(),
+                    decoder: decoder.to_string_lossy().into(),
+                    joiner: joiner.to_string_lossy().into(),
+                    tokens: tokens.to_string_lossy().into(),
+                });
+            }
+        }
+        None
+    }
+
     pub fn transcribe(&self, samples: &[f32]) -> (String, std::time::Duration) {
         let start = Instant::now();
-        let text = match &self.backend {
-            Backend::Streaming(recognizer) => {
+        let raw = match &self.backend {
+            Backend::Nemotron(recognizer) | Backend::Zipformer(recognizer) => {
                 let stream = recognizer.create_stream();
                 stream.accept_waveform(SAMPLE_RATE, samples);
                 stream.input_finished();
@@ -174,7 +423,124 @@ impl Asr {
                 stream.get_result().map(|r| r.text).unwrap_or_default()
             }
         };
-        (text.trim().to_string(), start.elapsed())
+        // Output policy per backend (see the module docs): Zipformer is
+        // always lowercased (+ punctuated when the model is present);
+        // Nemotron is polished only when the punct model is present, else
+        // its native cased/punctuated output is kept; Moonshine is never
+        // post-processed.
+        let text = match &self.backend {
+            Backend::Zipformer(_) => polish(self.punct.as_ref(), &raw),
+            Backend::Nemotron(_) => {
+                if self.punct.is_some() {
+                    polish(self.punct.as_ref(), &raw)
+                } else {
+                    raw.trim().to_string()
+                }
+            }
+            Backend::Moonshine(_) => raw.trim().to_string(),
+        };
+        (text, start.elapsed())
+    }
+}
+
+/// A live streaming ASR session on top of a shared `OnlineRecognizer`.
+///
+/// One session is one continuous stream of audio for the life of a
+/// dictation session. Feed 16 kHz f32 chunks in order; `partial()` returns
+/// the hypothesis for the utterance in progress; `commit()` finalizes the
+/// current utterance at a boundary (returns its final text) and resets the
+/// stream so the session keeps consuming the next utterance.
+pub struct StreamingSession<'a> {
+    recognizer: &'a OnlineRecognizer,
+    stream: OnlineStream,
+    punct: Option<&'a OnlinePunctuation>,
+    /// Backends with all-caps raw output (Zipformer) must always be
+    /// lowercased; backends with native casing (Nemotron) are polished only
+    /// when the punct model is available.
+    normalize: bool,
+}
+
+impl<'a> StreamingSession<'a> {
+    pub fn new(
+        recognizer: &'a OnlineRecognizer,
+        punct: Option<&'a OnlinePunctuation>,
+        normalize: bool,
+    ) -> Self {
+        Self {
+            recognizer,
+            stream: recognizer.create_stream(),
+            punct,
+            normalize,
+        }
+    }
+
+    /// Append a chunk of samples and run all pending decodes.
+    pub fn feed(&self, samples: &[f32]) {
+        self.stream.accept_waveform(SAMPLE_RATE, samples);
+        while self.recognizer.is_ready(&self.stream) {
+            self.recognizer.decode(&self.stream);
+        }
+    }
+
+    /// Apply this backend's output policy to raw recognizer text.
+    fn finish(&self, raw: &str) -> String {
+        if self.normalize || self.punct.is_some() {
+            polish(self.punct, raw)
+        } else {
+            raw.trim().to_string()
+        }
+    }
+
+    /// Current partial hypothesis for the utterance in progress, with the
+    /// backend's output policy applied.
+    pub fn partial(&self) -> String {
+        let raw = self
+            .recognizer
+            .get_result(&self.stream)
+            .map(|r| r.text)
+            .unwrap_or_default();
+        self.finish(&raw)
+    }
+
+    /// Finalize the utterance in progress: flush the decoder with end-of-
+    /// input semantics, return the final text (policy applied), and reset the
+    /// stream so the next utterance starts clean.
+    pub fn commit(&self) -> String {
+        self.stream.input_finished();
+        while self.recognizer.is_ready(&self.stream) {
+            self.recognizer.decode(&self.stream);
+        }
+        let raw = self
+            .recognizer
+            .get_result(&self.stream)
+            .map(|r| r.text)
+            .unwrap_or_default();
+        self.recognizer.reset(&self.stream);
+        self.finish(&raw)
+    }
+}
+
+/// Normalize raw streaming ASR output for typing/display: lowercase it,
+/// drop any existing punctuation (the punct model is trained on
+/// unpunctuated text; feeding it pre-punctuated text double-marks it), and
+///, when the online punctuation model is available, let it restore casing +
+/// punctuation. Without the model, the text is just lowercased/stripped
+/// (more readable than all-caps).
+fn polish(punct: Option<&OnlinePunctuation>, raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let mut text = String::with_capacity(trimmed.len());
+    for ch in trimmed.to_lowercase().chars() {
+        if matches!(ch, ',' | '.' | '?' | '!' | ';' | ':') {
+            continue;
+        }
+        text.push(ch);
+    }
+    match punct.and_then(|p| p.add_punctuation(&text)) {
+        Some(p) if !p.trim().is_empty() => p,
+        _ => text,
     }
 }
 
@@ -186,6 +552,20 @@ struct MoonshinePaths {
 }
 
 struct ZipformerPaths {
+    dir: PathBuf,
+    encoder: String,
+    decoder: String,
+    joiner: String,
+    tokens: String,
+}
+
+struct PunctPaths {
+    dir: PathBuf,
+    model: String,
+    vocab: String,
+}
+
+struct NemotronPaths {
     dir: PathBuf,
     encoder: String,
     decoder: String,
@@ -227,6 +607,30 @@ fn find_zipformer_onnx(dir: &Path, stem: &str) -> Option<PathBuf> {
         .collect();
     // Prefer a non-int8 variant if both are present.
     names.sort_by_key(|p| p.to_string_lossy().contains("int8"));
+    names.into_iter().next().map(|n| dir.join(n))
+}
+
+/// Find a `*{stem}*.onnx` file in `dir` (Nemotron layout: no "epoch" in the
+/// names), preferring the int8 variants (the official release form; an fp32
+/// Nemotron encoder would be ~2.4 GB).
+fn find_onnx_preferring_int8(dir: &Path, stem: &str) -> Option<PathBuf> {
+    let mut names: Vec<PathBuf> = std::fs::read_dir(dir)
+        .ok()?
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name())
+        .filter_map(|n| {
+            let s = n.to_string_lossy();
+            if s.ends_with(".onnx") && s.contains(stem) {
+                Some(n)
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>()
+        .into_iter()
+        .map(PathBuf::from)
+        .collect();
+    names.sort_by_key(|p| !p.to_string_lossy().contains("int8"));
     names.into_iter().next().map(|n| dir.join(n))
 }
 

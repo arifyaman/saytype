@@ -8,11 +8,14 @@
 // the session bus:
 //
 //   io.saytype.Dictate / io.saytype.Dictate1
-//     signals:  StateChanged(String), SegmentTranscribed(String)
+//     signals:  StateChanged(String), PartialTranscribed(String),
+//               SegmentTranscribed(String)
 //     methods:  Toggle(), Stop()
 //
-// The daemon drains the pipeline (final SegmentTranscribed) before
-// sending StateChanged("Idle"), so the last segment is always visible.
+// The pill shows the accumulating transcript: committed finals plus the
+// live partial tail. The daemon drains the pipeline (final
+// SegmentTranscribed) before sending StateChanged("Idle"), so the last
+// segment is always visible.
 //
 // ESM-first extension (GNOME 46): no `imports` module loader, no `Me`
 // global - Main comes from the shell's main.js module and the extension
@@ -41,12 +44,15 @@ const SayTypeInterface = `
   <interface name="${INTERFACE_NAME}">
     <method name="Toggle" />
     <method name="Stop" />
-    <signal name="StateChanged">
+     <signal name="StateChanged">
       <arg type="s" name="state" />
-    </signal>
-    <signal name="SegmentTranscribed">
+     </signal>
+     <signal name="PartialTranscribed">
       <arg type="s" name="text" />
-    </signal>
+     </signal>
+     <signal name="SegmentTranscribed">
+      <arg type="s" name="text" />
+     </signal>
   </interface>
 </node>`;
 const SayTypeProxy = Gio.DBusProxy.makeProxyWrapper(SayTypeInterface);
@@ -87,7 +93,10 @@ SayTypeHUD.prototype = {
     this._trackId = 0;
     this._pulseId = 0;
     this._pulseDimmed = false;
-    this._text = '';
+    // Accumulating session transcript: committed finals plus the live
+    // partial tail of the current utterance.
+    this._committed = '';
+    this._partial = '';
     this._recording = false;
 
     this._mic = new St.Label({
@@ -156,9 +165,13 @@ SayTypeHUD.prototype = {
       (p, sender, [state]) => {
         this._setState(state === 'Recording');
       }));
+    this._conns.push(proxy.connectSignal('PartialTranscribed',
+      (p, sender, [text]) => {
+        this._setPartial(text);
+      }));
     this._conns.push(proxy.connectSignal('SegmentTranscribed',
       (p, sender, [text]) => {
-        this._appendText(text);
+        this._appendFinal(text);
       }));
 
     // The proxy reports loss of the name owner (daemon died) so a stale
@@ -204,7 +217,8 @@ SayTypeHUD.prototype = {
     if (this._recording === recording)
       return;
     this._recording = recording;
-    this._text = '';
+    this._committed = '';
+    this._partial = '';
     this._updateLabel();
     if (recording) {
       this._layoutOverlay();
@@ -221,16 +235,31 @@ SayTypeHUD.prototype = {
     }
   },
 
-  _appendText(text) {
+  // A live partial for the utterance in progress; it replaces the current
+  // tail and is superseded by the next partial or the segment final.
+  _setPartial(text) {
     if (!this._recording)
       return;
-    this._text = this._text ? this._text + ' ' + text : text;
+    this._partial = text;
+    this._updateLabel();
+    this._queueReposition();
+  },
+
+  // A committed final: append to the transcript and clear the live tail.
+  _appendFinal(text) {
+    if (!this._recording)
+      return;
+    this._committed = this._committed ? this._committed + ' ' + text : text;
+    this._partial = '';
     this._updateLabel();
     this._queueReposition();
   },
 
   _updateLabel() {
-    this._label.set_text(this._text || IDLE_LABEL);
+    let shown = this._committed;
+    if (this._partial)
+      shown = shown ? shown + ' ' + this._partial : this._partial;
+    this._label.set_text(shown || IDLE_LABEL);
   },
 
   _layoutOverlay() {

@@ -123,6 +123,13 @@ impl Vad {
         self.inner.accept_waveform(samples);
     }
 
+    /// True while a segment is in progress: speech has started and the
+    /// `min_silence_duration` of trailing silence that finalizes the segment
+    /// has not elapsed yet.
+    pub fn detected(&self) -> bool {
+        self.inner.detected()
+    }
+
     /// Return the next finalized segment as `(samples, start)`, where `start`
     /// is the absolute input-sample index of the segment's first sample. The
     /// start lets the daemon fetch real context audio around the segment from
