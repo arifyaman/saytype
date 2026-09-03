@@ -16,10 +16,13 @@ Each dictation session runs a pipeline inside the `saytype` daemon:
 
 - **Daemon** (`saytype`): a Rust binary running as a systemd user service.
   Owns the audio pipeline, the models, and the D-Bus service.
-  ASR uses sherpa-onnx with two interchangeable backends, auto-detected from
-  `models/`: Moonshine v2 (preferred; batch per segment, outputs casing and
-  punctuation) or streaming Zipformer (fallback; the only backend able to
-  produce live partials, needed for future real-time typing).
+  ASR uses sherpa-onnx with three interchangeable backends, auto-detected
+  from `models/`: NVIDIA Nemotron Speech Streaming EN 0.6B (preferred; truly
+  streaming, live partials, native casing/punctuation, ~530k h training),
+  streaming Zipformer (streaming fallback; all-caps output post-processed by
+  an optional online punctuation model), and Moonshine v2 (batch per
+  segment). Live partials power the real-time typing: text is typed into the
+  target app word-by-word as it is recognized.
 - **HUD** (`extension/saytype@saytype.local/`): a GNOME Shell extension that
   lives inside gnome-shell.
   It is a plain D-Bus client - no audio, no models.
@@ -30,7 +33,8 @@ Each dictation session runs a pipeline inside the `saytype` daemon:
 - **IPC**: the session D-Bus bus.
   Bus name `io.saytype.Dictate`, path `/io/saytype/Dictate`, interface
   `io.saytype.Dictate1`.
-  Methods `Toggle()` / `Stop()`; signals `StateChanged(String)` and
+  Methods `Toggle()` / `Stop()`; signals `StateChanged(String)`,
+  `PartialTranscribed(String)` (live hypothesis, streaming backend only) and
   `SegmentTranscribed(String)`.
   The daemon always emits the final `SegmentTranscribed` before
   `StateChanged("Idle")`.
@@ -46,7 +50,8 @@ Each dictation session runs a pipeline inside the `saytype` daemon:
 
 ```sh
 scripts/setup-ydotool.sh          # one-time: apt ydotool, udev rule, ydotoold service
-scripts/download-models.sh        # Silero VAD + Moonshine v2 + Zipformer into models/
+scripts/download-models.sh        # default stack into models/ (VAD + Nemotron streaming + punct)
+                                  #   add --zipformer / --moonshine / --all for the other backends
 scripts/install-user-service.sh   # release build, install binary + saytype-toggle, enable service
 scripts/install-extension.sh      # install + enable the HUD extension
 ```
@@ -74,6 +79,31 @@ Offline model checks (16 kHz mono WAV, e.g. from `models/*/test_wavs/`):
 saytype --transcribe <wav>
 saytype --vad-test <wav>
 ```
+
+## Model selection
+
+All three ASR backends can coexist in `models/`; the daemon auto-detects
+whatever is present and, with the default `auto` selection, picks Nemotron
+streaming, then Zipformer streaming, then Moonshine (batch).
+`scripts/download-models.sh` fetches only the default stack (Nemotron) by
+default; add `--zipformer`, `--moonshine` or `--all` to fetch the other
+backends.
+
+To force a backend, add `--asr <name>` to `ExecStart` in
+`~/.config/systemd/user/saytype.service` and run
+`systemctl --user daemon-reload && systemctl --user restart saytype`:
+
+- `auto` (default) - best available, in the order above
+- `streaming` - best streaming backend (Nemotron, then Zipformer)
+- `zipformer` / `moonshine` - force that specific backend
+
+The streaming backends (Nemotron, Zipformer) give live typing: words land
+in the target app as they are recognized, and the HUD pill shows a live
+partial. The offline backend (Moonshine) transcribes each finished
+utterance in one pass - one typed chunk per utterance, no live partials.
+Only these three dir layouts are auto-detected (detection lives in
+`src/asr.rs`); other sherpa-onnx offline models (Whisper, Parakeet TDT,
+Canary, SenseVoice, ...) are not picked up today.
 
 ## Development
 

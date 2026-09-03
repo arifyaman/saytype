@@ -1,6 +1,5 @@
 [Unit]
 Description=SayType speech-to-text dictation daemon
-Documentation=https://github.com/
 After=pipewire.service sound.target
 Wants=sound.target
 

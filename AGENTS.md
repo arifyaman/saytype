@@ -13,7 +13,7 @@ focus-free HUD pill (recording state + transcript) while dictating.
 
 Pipeline per dictation session:
 
-    PipeWire mic capture -> Silero VAD -> sherpa-onnx ASR (Moonshine v2 or streaming Zipformer, EN) -> ydotool typing
+    PipeWire mic capture -> Silero VAD -> sherpa-onnx ASR (streaming Zipformer, EN; Moonshine v2 batch fallback) -> ydotool typing
 
 ## Processes and IPC
 
@@ -22,30 +22,33 @@ Pipeline per dictation session:
   saytype process; the daemon no longer spawns a UI.
 - The HUD is a **GNOME Shell extension** (`extension/saytype@saytype.local/`).
   It runs inside gnome-shell (gjs), not in our process: a plain D-Bus client
-  with no audio and no models. It draws a pill below the top panel while
-  recording; being shell-stage artwork it never steals focus and behaves
+  with no audio and no models. While recording it draws a dim overlay across
+  all monitors plus a pill that follows the mouse pointer (so it is visible
+  on any screen); being shell-stage artwork it never steals focus and behaves
   identically on X11 and Wayland. Installed with
   `scripts/install-extension.sh`.
 - IPC is the session D-Bus bus:
   - Bus name `io.saytype.Dictate`, path `/io/saytype/Dictate`, interface `io.saytype.Dictate1`
   - Methods: `Toggle()`, `Stop()`
-  - Signals: `StateChanged(String)`, `SegmentTranscribed(String)`
+  - Signals: `StateChanged(String)`, `PartialTranscribed(String)`, `SegmentTranscribed(String)`
+  - `PartialTranscribed` is a live hypothesis for the utterance in progress
+    (streaming backend only); `SegmentTranscribed` is the committed final.
 
 ## File map
 
 | File | What to find there |
 |---|---|
-| `src/main.rs` | CLI dispatch (daemon / `--transcribe <wav>` / `--vad-test <wav>`), models-dir resolution, logging |
-| `src/daemon.rs` | D-Bus service, `Engine` state machine (Idle/Recording), per-session pipeline tasks (`vad_task`, `asr_task`, `injector_task`) |
+| `src/main.rs` | CLI dispatch (daemon / `--transcribe <wav>` / `--vad-test <wav>` / `--stream-test <wav>`, all take `--asr`), models-dir resolution, logging |
+| `src/daemon.rs` | D-Bus service, `Engine` state machine (Idle/Recording), per-session pipeline: `stream_task` (streaming) or `vad_task`+`asr_task` (batch), `injector_task`; `EngineEvent`/`AsrOutput` |
 | `src/audio.rs` | PipeWire capture on a dedicated OS thread; S16LE 16 kHz mono in, f32 frames out via mpsc |
-| `src/vad.rs` | Silero VAD wrapper, `VadParams` defaults, `AudioRing` context-padding buffer + unit tests |
-| `src/asr.rs` | `Asr` dual backend (Moonshine `OfflineRecognizer` preferred, streaming Zipformer `OnlineRecognizer` fallback), model auto-detection, batch `transcribe()` |
-| `src/injector.rs` | ydotool typing (`type_text`), `capitalize_first` MVP punctuation stand-in + test |
-| `extension/saytype@saytype.local/` | GNOME Shell extension HUD (gjs, ESM-first): D-Bus proxy client, top-center pill (inline St styles, emoji mic), `metadata.json` |
-| `models/` | `silero_vad.onnx` + ASR model dirs (Moonshine v2 preferred, streaming zipformer fallback; gitignored; `scripts/download-models.sh`) |
+| `src/vad.rs` | Silero VAD wrapper, `detected()` in-progress probe, `VadParams` defaults, `AudioRing` context-padding buffer (batch path) + unit tests |
+| `src/asr.rs` | `Asr` tri-backend (Nemotron streaming `OnlineRecognizer` preferred, Zipformer `OnlineRecognizer` fallback, Moonshine `OfflineRecognizer` batch), `BackendSelection`/`AsrKind`, `StreamingSession` (feed/partial/commit), batch `transcribe()`, `polish()` (lowercase + strip punct + online punct) output policy, optional `OnlinePunctuation` model auto-detect |
+| `src/injector.rs` | ydotool typing (`type_text`, `backspaces`), `diff` prefix-diff, `capitalize_first` MVP punctuation stand-in + tests |
+| `extension/saytype@saytype.local/` | GNOME Shell extension HUD (gjs, ESM-first): D-Bus proxy client, pointer-following pill + dim overlay (inline St styles, emoji mic), committed+partial transcript, `metadata.json` |
+| `models/` | `silero_vad.onnx` + ASR model dirs (Nemotron streaming preferred, Zipformer + Moonshine v2 fallbacks) + optional online punct dir; gitignored; default install has only the Nemotron stack |
 | `systemd/saytype.service` | Unit template with `@REPO@`/`@BIN@` placeholders |
 | `scripts/setup-ydotool.sh` | One-time: apt ydotool, udev rule for `/dev/uinput`, `ydotoold` user service |
-| `scripts/download-models.sh` | Downloads the VAD + Zipformer models into `models/` |
+| `scripts/download-models.sh` | Downloads VAD + Nemotron streaming + online punct into `models/` (default); `--zipformer` / `--moonshine` / `--all` fetch the other backends |
 | `scripts/install-user-service.sh` | Release build, install binary + `saytype-toggle` to `~/.local/bin`, install/enable service |
 | `scripts/install-extension.sh` | Copy the HUD extension into `~/.local/share/gnome-shell/extensions/` + enable it (`--uninstall` to reverse) |
 | `scripts/saytype-toggle` | `dbus-send` Toggle wrapper; bind this to a GNOME custom shortcut |
@@ -54,15 +57,44 @@ Pipeline per dictation session:
 
 ## Pipeline data flow (daemon.rs)
 
-One task per stage, chained with tokio mpsc channels, spawned per session:
+One task per stage, chained with tokio mpsc channels, spawned per session.
+Two shapes depending on the active backend:
 
-    audio thread -> frames -> vad_task -> segs -> asr_task -> texts -> injector_task -> ydotool
+Streaming (Nemotron EN 0.6B 560 ms by default, Zipformer fallback):
 
-State/segment events flow back over an unbounded channel into `run()`, which
-emits the D-Bus signals. The injector is a single consumer, so ydotool calls
-are strictly serialized. On stop the daemon drains the pipeline (final
-`SegmentTranscribed`) **before** emitting `StateChanged("Idle")`; consumers
-may rely on that order.
+    audio thread -> frames -> stream_task (VAD + one continuous OnlineStream)
+                 -> AsrOutput (Partial | Final) -> injector_task -> ydotool
+
+The VAD only supplies **commit boundaries**: a finalized segment (0.8 s
+pause) finalizes the current utterance (`commit()`), and live partials are
+emitted on a 150 ms tick while `vad.detected()`.
+
+**Casing/punctuation** (streaming path): every partial/final is passed
+through `polish()` - lowercased, existing punctuation stripped, then run
+through the optional online punct model (`OnlinePunctuation`, auto-detected
+in `models/`) which restores casing + punctuation. The Zipformer emits
+all-caps and needs this always; Nemotron is natively cased/punctuated and
+is only polished when the punct model is present (denser punctuation, and
+the strip step prevents double-marking), otherwise its native output is
+kept. Moonshine (batch) output is never post-processed.
+
+**Live typing** (on by default for the streaming backend, off with
+`--no-live-typing`): the injector types a partial's prefix into the target
+app once it has survived `STABILITY_PARTIALS` (2) consecutive partials,
+corrects the tail with `backspaces` + retype as the decoder revises it, and
+each `Final` converges the buffer to the committed text (prefix-diff via
+`injector::diff`) then resets. Without live typing, only finals are typed
+(one chunk per utterance, the MVP1 behavior).
+
+Batch (Moonshine):
+
+    audio thread -> frames -> vad_task -> segs -> asr_task -> AsrOutput -> injector_task -> ydotool
+
+State/partial/segment events flow back over an unbounded channel into
+`run()`, which emits the D-Bus signals. The injector is a single consumer,
+so ydotool calls are strictly serialized. On stop the daemon drains the
+pipeline (final `SegmentTranscribed`) **before** emitting
+`StateChanged("Idle")`; consumers may rely on that order.
 
 ## Gotchas (read before touching code)
 
@@ -74,23 +106,43 @@ may rely on that order.
    core, stream) lives on one dedicated OS thread in `audio.rs`. `pod_bytes`
    from the FFI `pw_stream_connect` must outlive the stream.
 3. **VAD trims segments to the detected speech boundaries**, so the first
-   word's attack and the last word's tail get clipped. Segments are re-padded
-   from the `AudioRing` (raw audio, absolute sample indexes): 300 ms pre /
-   800 ms post (`PRE_PAD_MS`/`POST_PAD_MS` in vad.rs). Do not "simplify" the
-   ring away.
-4. **ASR is batch-per-segment in v1 (no live partials).** Zipformer path:
-   fresh `OnlineStream`, feed the whole padded segment, `input_finished()`,
-   decode loop, `get_result()`, `enable_endpoint = false`, greedy search.
-   Moonshine path: fresh offline stream, feed the segment, single
-   `decode()`, `get_result()`. Both: CPU provider, thread count from config.
-5. **Models are auto-detected, not hardcoded.** `asr.rs` scans `models/` and
-   prefers a **Moonshine v2** dir (`encoder_model.*` + `decoder_model_merged.*`
-   as `.onnx`/`.ort` + `tokens.txt`, 16 kHz input) over a
-   `sherpa-onnx-streaming-zipformer-*` dir (encoder/decoder/joiner
-   `*epoch*.onnx` + `tokens.txt`, non-int8 variants preferred). Both can
-   coexist; remove one dir to switch. Only the zipformer backend can produce
-   live partials (mvp2); Moonshine is batch-per-segment but outputs proper
-   casing and punctuation.
+   word's attack and the last word's tail get clipped. **Batch (Moonshine)
+   path only**: segments are re-padded from the `AudioRing` (raw audio,
+   absolute sample indexes): 300 ms pre / 800 ms post
+   (`PRE_PAD_MS`/`POST_PAD_MS` in vad.rs). Do not "simplify" the ring away
+   while the batch path exists. The **streaming path does not use the
+   ring**: the `OnlineStream` sees every sample live, and the 0.8 s pause
+   that finalizes a VAD segment is exactly the trailing silence the decoder
+   needs to commit the last word, so no padding is required.
+4. **Streaming ASR is one continuous session per dictation session**
+   (`stream_task` in daemon.rs, `StreamingSession` in asr.rs). The
+   `OnlineStream` is created once, fed every frame in order, `partial()`
+   mid-stream returns the live hypothesis, and at each VAD commit boundary
+   `commit()` runs `input_finished()`, a decode loop, `get_result()`, then
+   `reset()` for the next utterance. `enable_endpoint = false` - VAD
+   finalization is the only commit boundary. `OnlineRecognizer`/`OnlineStream`
+   are `Send + Sync` (single-object C library), so the session lives inside
+   the tokio task. The **Moonshine path** is still batch-per-segment: fresh
+   offline stream, feed the padded segment, single `decode()`,
+   `get_result()`. Both: CPU provider, thread count from config.
+ 5. **Models are auto-detected, not hardcoded.** `asr.rs` scans `models/` and
+    (for `auto`) prefers a **Nemotron streaming** dir
+    (`sherpa-onnx-nemotron-speech-streaming-en-*`: encoder/decoder/joiner
+    `*.onnx` + `tokens.txt`, int8 variants preferred; loaded with
+    `model_type = "nemo_transducer"`) over a **streaming Zipformer** dir
+    (`sherpa-onnx-streaming-zipformer-*`: encoder/decoder/joiner
+    `*epoch*.onnx` + `tokens.txt`, non-int8 variants preferred) over a
+    **Moonshine v2** dir (`encoder_model.*` + `decoder_model_merged.*` as
+    `.onnx`/`.ort` + `tokens.txt`, 16 kHz input). All can coexist; `--asr
+    streaming|zipformer|moonshine` forces a backend. Both streaming backends
+    produce live partials (mvp2); Moonshine is batch-per-segment. A separate
+    **online punct** dir (`sherpa-onnx-online-punct-*`:
+    `model.int8.onnx`/`model.onnx` + `bpe.vocab`) is auto-detected and, when
+    present, restores casing + punctuation on the streaming path (the
+    Zipformer emits all-caps and needs it always; Nemotron is only polished
+    for denser punctuation). It is optional - without it, Zipformer text is
+    lowercased but unpunctuated, and Nemotron text keeps its native
+    casing/punctuation.
 6. **The HUD is a GNOME Shell extension, not a process.** It runs inside
    gnome-shell (gjs). Keep it small and defensive: a JS fault there can take
    the whole shell down. The shell does **not** hot-load changed user
@@ -128,10 +180,11 @@ may rely on that order.
 8. **Build env**: `.cargo/config.toml` sets `LIBCLANG_PATH` and
    `BINDGEN_EXTRA_CLANG_ARGS` (bindgen needs them for the pipewire/sherpa-onnx
    crates). Non-interactive shells don't have `~/.cargo/bin` on PATH.
-9. **Audio source matters.** The system default input must be the real
-   microphone (on this machine: UMC202HD, mic on the left channel). A wrong
-   default (e.g. a webcam's IEC958 line) yields garbage. Check with
-   `wpctl status` / set with `wpctl set-default <node>`.
+ 9. **Audio source matters.** The system default input must be the real
+    microphone. A wrong default (e.g. a webcam's IEC958 line or a virtual
+    device) yields garbage - some mics also only deliver audio on one
+    channel, which is fine as long as it is the mic's real channel. Check
+    with `wpctl status` / set with `wpctl set-default <node>`.
 
 ## Build, run, test
 
@@ -153,13 +206,16 @@ scripts/install-extension.sh      # Alt+F2 -> r (X11) or log out/in afterwards
 gdbus monitor --session --dest io.saytype.Dictate --object-path /io/saytype/Dictate
 
 # offline model checks (16 kHz mono WAV, e.g. models/*/test_wavs/)
-saytype --transcribe <wav>
+saytype --transcribe <wav>            # batch check (auto backend)
 saytype --vad-test <wav>
+saytype --stream-test <wav>           # streaming replay: partials + finals + RTF
 ```
 
 End-to-end check: toggle, speak a sentence, verify the text lands in the
-focused app, the HUD pill shows the transcript, and `journalctl` shows
-`VAD segment complete` + `transcribed ...`.
+focused app **word-by-word while speaking** (with occasional
+backspace-corrections as the decoder revises), the HUD pill shows the
+accumulating transcript (committed + live partial), and `journalctl` shows
+`VAD segment complete` + `streaming commit: ...`.
 
 ## Conventions
 
