@@ -7,7 +7,8 @@
 //!   the live partial if an utterance is in progress, else from the tail of
 //!   the committed text.
 //! - `undo_last` (right mouse press) restores the most recently erased word
-//!   (LIFO: multiple erases are undone one by one in reverse order).
+//!   (LIFO: multiple erases are undone one by one in reverse order), putting
+//!   it back at its **original position** in the text.
 //! - An erase is restorable only until the next **new word** is transcribed:
 //!   a partial that grows beyond any earlier partial of the utterance, or
 //!   a final containing words no partial showed. From then on the word is
@@ -16,12 +17,17 @@
 //! Erased words are tracked two ways, because a word can be erased while it
 //! is still only a live hypothesis or after it has committed:
 //!
-//! - committed erasures pop a token off the committed text (restoring
-//!   re-appends it);
+//! - committed erasures hide a slot of the committed token sequence
+//!   (restoring un-hides it, so the word returns to where it was);
 //! - partial erasures record the token **position** in the current
 //!   utterance, so decoder revisions (a token changing or dropping at that
 //!   position) keep the mapping correct. At the final, surviving positions
-//!   convert into restorable committed erasures.
+//!   convert into restorable committed-slot erasures.
+//!
+//! Committed tokens are stored raw (as the ASR emitted them); casing is
+//! applied at render time - the first visible word of each segment is
+//! capitalized - so erasing/undoing the first word of a segment re-derives
+//! the casing of whatever word takes its place.
 //!
 //! The state machine is pure: no audio, no ASR, no ydotool. The injector
 //! task feeds it and applies the resulting buffer edits (see
@@ -34,8 +40,8 @@ use crate::injector::capitalize_first;
 /// One entry of the LIFO undo stack.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Undo {
-    /// A token popped off the committed text; restoring re-appends it.
-    Committed(String),
+    /// A committed slot hidden by a pending erasure; restoring un-hides it.
+    Committed(usize),
     /// A token position erased in the current partial; restoring
     /// re-includes the position.
     Partial(usize),
@@ -44,11 +50,17 @@ enum Undo {
 /// One dictation session's visible transcript.
 #[derive(Debug, Default)]
 pub struct Transcript {
-    /// Exact text the target buffer holds from committed segments, after
-    /// all erasures. Each segment's first visible word is capitalized and a
-    /// single space separates segments (and words), so the string is also
-    /// the token layout of the buffer.
-    committed: String,
+    /// The full token sequence of the committed segments, in order.
+    /// `None` marks a permanently erased position: a gap the visible text
+    /// never fills in. Tokens are raw; casing is applied at render time.
+    committed: Vec<Option<String>>,
+    /// The start index in `committed` of each committed segment; the last
+    /// segment runs to the end of the vec.
+    segment_starts: Vec<usize>,
+    /// Committed slots currently hidden by a pending (restorable)
+    /// erasure. Disjoint with the `None` slots: a slot is either
+    /// visible, hidden-pending, or gone.
+    hidden: BTreeSet<usize>,
     /// LIFO of erased words that are still restorable; the last element is
     /// what the next `undo_last` restores.
     undo: Vec<Undo>,
@@ -99,13 +111,53 @@ impl Transcript {
             .join(" ")
     }
 
-    /// New words were transcribed: pending partial erasures become
-    /// permanent, pending committed erasures are discarded (their tokens
-    /// are already out of the committed text).
+    /// One committed segment's visible tokens, in order (raw).
+    fn segment_tokens(&self, start: usize, end: usize) -> Vec<&str> {
+        (start..end)
+            .filter(|&i| !self.hidden.contains(&i))
+            .filter_map(|i| self.committed[i].as_deref())
+            .collect()
+    }
+
+    /// One committed segment's visible text: its visible tokens joined by a
+    /// single space, the first word capitalized; empty when the segment has
+    /// no visible tokens.
+    fn segment_text(&self, start: usize, end: usize) -> String {
+        let toks = self.segment_tokens(start, end);
+        if toks.is_empty() {
+            return String::new();
+        }
+        capitalize_first(&toks.join(" "))
+    }
+
+    /// The committed text: each segment's visible text, one space between
+    /// non-empty segments.
+    fn committed_text(&self) -> String {
+        let mut segs: Vec<String> = Vec::new();
+        let mut prev = 0usize;
+        for &end in self.segment_starts.iter().chain(std::iter::once(&self.committed.len())) {
+            let t = self.segment_text(prev, end);
+            if !t.is_empty() {
+                segs.push(t);
+            }
+            prev = end;
+        }
+        segs.join(" ")
+    }
+
+    /// New words were transcribed: pending erasures become permanent.
+    /// Partial positions join the `erased` set; hidden committed slots
+    /// become gaps (the token is dropped from the sequence).
     fn flush_undos(&mut self) {
         for u in self.undo.drain(..) {
-            if let Undo::Partial(i) = u {
-                self.erased.insert(i);
+            match u {
+                Undo::Partial(i) => {
+                    self.erased.insert(i);
+                }
+                Undo::Committed(i) => {
+                    self.hidden.remove(&i);
+                    self.committed[i] = None;
+                }
             }
         }
     }
@@ -126,11 +178,10 @@ impl Transcript {
     }
 
     /// The utterance in progress committed with this final text
-    /// (streaming path). Its visible tokens are appended to the committed
-    /// text (transformed). Pending partial erasures at positions the final
-    /// still contains become restorable committed-token erasures (same LIFO
-    /// order); positions the final dropped (the decoder revised the word
-    /// away) are discarded.
+    /// (streaming path). Its tokens are appended to the committed sequence:
+    /// permanently erased positions as gaps, pending partial erasures as
+    /// hidden slots (same LIFO order, converted to slot indexes), the rest
+    /// visible.
     pub fn feed_final(&mut self, text: &str) {
         let tokens = Self::tokens(text);
         if tokens.len() > self.partial_max_tokens {
@@ -139,27 +190,31 @@ impl Transcript {
             self.flush_undos();
             self.partial_max_tokens = tokens.len();
         }
+        let base = self.committed.len();
+        // Pending partial erasures whose position the final still contains
+        // become restorable committed-slot erasures; positions the final
+        // dropped (the decoder revised the word away) are discarded.
+        // Committed erasures of earlier segments pass through unchanged.
         let mut converted: Vec<Undo> = Vec::new();
-        let mut convert_at: BTreeSet<usize> = BTreeSet::new();
         for u in self.undo.drain(..) {
             match u {
                 Undo::Partial(i) if i < tokens.len() => {
-                    convert_at.insert(i);
-                    converted.push(Undo::Committed(tokens[i].clone()));
+                    let slot = base + i;
+                    self.hidden.insert(slot);
+                    converted.push(Undo::Committed(slot));
                 }
-                Undo::Partial(_) => {}
-                Undo::Committed(c) => converted.push(Undo::Committed(c)),
+                Undo::Committed(i) => converted.push(Undo::Committed(i)),
+                _ => {}
             }
         }
-        let mut visible = tokens;
-        let mut drop = self.erased.clone();
-        drop.extend(convert_at);
-        for &i in drop.iter().rev() {
-            if i < visible.len() {
-                visible.remove(i);
-            }
+        // Append the segment: permanently erased positions become gaps.
+        for (i, tok) in tokens.into_iter().enumerate() {
+            self.committed
+                .push(if self.erased.contains(&i) { None } else { Some(tok) });
         }
-        self.append_segment(&visible);
+        if base < self.committed.len() {
+            self.segment_starts.push(base);
+        }
 
         // Start a fresh utterance.
         self.partial_tokens.clear();
@@ -170,27 +225,21 @@ impl Transcript {
 
     /// A new utterance's final (batch path: no partials in flight). Any
     /// pending erasures are permanent - a whole new utterance was
-    /// transcribed - then the text is appended transformed.
+    /// transcribed - then the text is committed.
     pub fn feed_batch_final(&mut self, text: &str) {
-        self.undo.clear();
+        self.flush_undos();
         self.partial_tokens.clear();
         self.partial_max_tokens = 0;
         self.erased.clear();
-        self.append_segment(&Self::tokens(text));
-    }
-
-    /// Append one committed segment's visible tokens, transformed: first
-    /// letter capitalized, a single space in front when the committed text
-    /// is non-empty.
-    fn append_segment(&mut self, tokens: &[String]) {
+        let tokens = Self::tokens(text);
         if tokens.is_empty() {
             return;
         }
-        let mut seg = capitalize_first(&tokens.join(" "));
-        if !self.committed.is_empty() {
-            seg.insert(0, ' ');
+        let base = self.committed.len();
+        for tok in tokens {
+            self.committed.push(Some(tok));
         }
-        self.committed.push_str(&seg);
+        self.segment_starts.push(base);
     }
 
     /// Erase the last visible word (left mouse press). The last word of the
@@ -202,20 +251,18 @@ impl Transcript {
         let last = (0..self.partial_tokens.len())
             .rev()
             .find(|i| !excluded.contains(i));
+        if let Some(i) = last {
+            self.undo.push(Undo::Partial(i));
+            return true;
+        }
+        // The last visible committed slot, scanning from the tail.
+        let last = (0..self.committed.len())
+            .rev()
+            .find(|&i| self.committed[i].is_some() && !self.hidden.contains(&i));
         match last {
             Some(i) => {
-                self.undo.push(Undo::Partial(i));
-                true
-            }
-            None if !self.committed.is_empty() => {
-                // Pop the last whitespace token, together with its
-                // separating space (or the whole string when it is the
-                // only token).
-                let sp = self.committed.rfind(' ');
-                let start = sp.map(|p| p + 1).unwrap_or(0);
-                let tok = self.committed[start..].to_string();
-                self.committed.truncate(sp.unwrap_or(0));
-                self.undo.push(Undo::Committed(tok));
+                self.hidden.insert(i);
+                self.undo.push(Undo::Committed(i));
                 true
             }
             None => false,
@@ -223,18 +270,14 @@ impl Transcript {
     }
 
     /// Restore the last erased word (right mouse press), LIFO. Returns true
-    /// if an erase was undone. Restoring a partial position whose token the
-    /// decoder since dropped is a no-op on the visible text but still
-    /// consumes the undo entry.
+    /// if an erase was undone. Restoring a committed slot puts the word
+    /// back at its original position; restoring a partial position whose
+    /// token the decoder since dropped is a no-op on the visible text but
+    /// still consumes the undo entry.
     pub fn undo_last(&mut self) -> bool {
         match self.undo.pop() {
-            Some(Undo::Committed(tok)) => {
-                if self.committed.is_empty() {
-                    self.committed.push_str(&tok);
-                } else {
-                    self.committed.push(' ');
-                    self.committed.push_str(&tok);
-                }
+            Some(Undo::Committed(i)) => {
+                self.hidden.remove(&i);
                 true
             }
             Some(Undo::Partial(_)) => true,
@@ -246,12 +289,13 @@ impl Transcript {
     /// erasures applied).
     pub fn display(&self) -> String {
         let p = self.visible_partial();
+        let c = self.committed_text();
         if p.is_empty() {
-            self.committed.clone()
-        } else if self.committed.is_empty() {
+            c
+        } else if c.is_empty() {
             p
         } else {
-            format!("{} {}", self.committed, p)
+            format!("{c} {p}")
         }
     }
 
@@ -261,7 +305,7 @@ impl Transcript {
     /// (a prefix of the visible partial); an empty `stable` types nothing
     /// of the partial yet.
     pub fn buffer_target(&self, stable: &str) -> String {
-        let mut out = self.committed.clone();
+        let mut out = self.committed_text();
         if !self.visible_partial().is_empty() && !stable.is_empty() {
             if !out.is_empty() {
                 out.push(' ');
@@ -338,7 +382,7 @@ mod tests {
     #[test]
     fn erase_from_committed_when_no_partial() {
         let mut t = Transcript::new();
-        t.feed_final("Hello world");
+        t.feed_final("hello world");
         assert!(t.erase_last());
         assert_eq!(t.display(), "Hello");
         assert!(t.erase_last());
@@ -566,5 +610,64 @@ mod tests {
         t.feed_partial("jumps over");
         assert_eq!(t.display(), "The quick fox jumps over");
         assert_eq!(t.buffer_target("jumps"), "The quick fox Jumps");
+    }
+
+    #[test]
+    fn restored_word_returns_to_its_original_position() {
+        let mut t = Transcript::new();
+        t.feed_partial("a b c d e");
+        assert!(t.erase_last()); // e (position 4)
+        // The decoder collapses the tail: "d" and "e" drop out of the
+        // partial. No new word, so the erasure stays restorable.
+        t.feed_partial("a b");
+        assert!(t.erase_last()); // b (position 1)
+        // The final re-expands to all five words: both erasures survive as
+        // committed-slot erasures.
+        t.feed_final("a b c d e");
+        assert_eq!(t.display(), "A c d");
+        // Undo restores "b" to its original position (between "a" and
+        // "c"), not to the end; "e" is still erased.
+        assert!(t.undo_last());
+        assert_eq!(t.display(), "A b c d");
+        assert!(t.undo_last());
+        assert_eq!(t.display(), "A b c d e");
+        assert!(!t.undo_last());
+        // The typed buffer follows the same ordering.
+        assert_eq!(t.buffer_target(""), "A b c d e");
+    }
+
+    #[test]
+    fn fully_erased_segment_leaves_a_gap_that_undoes_cleanly() {
+        let mut t = Transcript::new();
+        t.feed_final("one two");
+        t.feed_final("three four");
+        // Erase both words of the second segment.
+        assert!(t.erase_last()); // four
+        assert!(t.erase_last()); // three
+        assert_eq!(t.display(), "One two");
+        // Undo restores them in place, before any later segment.
+        assert!(t.undo_last());
+        assert_eq!(t.display(), "One two Three");
+        assert!(t.undo_last());
+        assert_eq!(t.display(), "One two Three four");
+        // A new utterance makes the still-pending erasure permanent only
+        // for words that were not restored: erase "four" again, then speak.
+        assert!(t.erase_last());
+        t.feed_batch_final("five");
+        assert_eq!(t.display(), "One two Three Five");
+        assert!(!t.undo_last());
+    }
+
+    #[test]
+    fn erasing_and_restoring_a_segments_first_word_keeps_casing() {
+        let mut t = Transcript::new();
+        t.feed_final("hello world");
+        assert!(t.erase_last()); // world
+        assert!(t.erase_last()); // hello
+        assert_eq!(t.display(), "");
+        assert!(t.undo_last());
+        assert_eq!(t.display(), "Hello");
+        assert!(t.undo_last());
+        assert_eq!(t.display(), "Hello world");
     }
 }
