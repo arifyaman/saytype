@@ -3,19 +3,25 @@
 // While dictation is active it draws a dim overlay across all monitors and
 // a pill near the mouse pointer (which it tracks), so the HUD is visible on
 // any screen in a multi-monitor setup. It is a Clutter actor on the shell
-// stage, not a window, so it never steals focus and works the same on X11
-// and Wayland sessions. All state arrives over
-// the session bus:
+// stage, not a window, so it never steals keyboard focus and works the
+// same on X11 and Wayland sessions. All state arrives over the session
+// bus. The HUD consumes/calls only these members of the interface (the
+// full D-Bus API, incl. Toggle()/Stop() used by the custom hotkey, is
+// documented in AGENTS.md):
 //
 //   io.saytype.Dictate / io.saytype.Dictate1
-//     signals:  StateChanged(String), PartialTranscribed(String),
-//               SegmentTranscribed(String)
-//     methods:  Toggle(), Stop()
+//     signals:  StateChanged(String), TranscriptUpdated(String)
+//     methods:  EraseWord(), UndoErase()
 //
-// The pill shows the accumulating transcript: committed finals plus the
-// live partial tail. The daemon drains the pipeline (final
-// SegmentTranscribed) before sending StateChanged("Idle"), so the last
-// segment is always visible.
+// TranscriptUpdated carries the daemon's authoritative visible transcript
+// (committed finals plus the live partial, mid-dictation erasures applied,
+// casing/punctuation restored); the pill renders it verbatim. While
+// recording the dim overlay is also the input surface: a LEFT press erases
+// the last word (EraseWord) and a RIGHT press restores it (UndoErase).
+// The overlay is a focus-free stage actor, so it never moves keyboard
+// focus - dictation keeps landing in the focused app - but while it is up
+// it captures mouse presses, so in-app mouse clicks require toggling off
+// first. Dictation is started/stopped with the custom hotkey.
 //
 // ESM-first extension (GNOME 46): no `imports` module loader, no `Me`
 // global - Main comes from the shell's main.js module and the extension
@@ -42,17 +48,14 @@ const INTERFACE_NAME = 'io.saytype.Dictate1';
 const SayTypeInterface = `
 <node>
   <interface name="${INTERFACE_NAME}">
-    <method name="Toggle" />
-    <method name="Stop" />
-     <signal name="StateChanged">
+    <method name="EraseWord" />
+    <method name="UndoErase" />
+    <signal name="StateChanged">
       <arg type="s" name="state" />
-     </signal>
-     <signal name="PartialTranscribed">
+    </signal>
+    <signal name="TranscriptUpdated">
       <arg type="s" name="text" />
-     </signal>
-     <signal name="SegmentTranscribed">
-      <arg type="s" name="text" />
-     </signal>
+    </signal>
   </interface>
 </node>`;
 const SayTypeProxy = Gio.DBusProxy.makeProxyWrapper(SayTypeInterface);
@@ -93,10 +96,10 @@ SayTypeHUD.prototype = {
     this._trackId = 0;
     this._pulseId = 0;
     this._pulseDimmed = false;
-    // Accumulating session transcript: committed finals plus the live
-    // partial tail of the current utterance.
-    this._committed = '';
-    this._partial = '';
+    // The daemon's authoritative visible transcript (committed finals
+    // plus the live partial, erasures applied, casing/punctuation
+    // restored). Rendered verbatim in the pill.
+    this._transcript = '';
     this._recording = false;
 
     this._mic = new St.Label({
@@ -112,29 +115,43 @@ SayTypeHUD.prototype = {
     });
     this._label.clutter_text.ellipsize = Pango.EllipsizeMode.END;
 
+    // Visual only: not reactive, so mouse presses fall through to the
+    // recording overlay below (erase/undo). Start/stop is driven by the
+    // custom hotkey, not by clicking the pill.
     this._pill = new St.BoxLayout({
       vertical: false,
       style: PILL_STYLE,
-      reactive: true,
     });
     this._pill.add_child(this._mic);
     this._pill.add_child(this._label);
     this._pill.hide();
-    this._pill.connect('button-press-event', () => {
-      this._callToggle();
-      return Clutter.EVENT_STOP;
-    });
 
-    // Full-screen dim shown while recording. Non-reactive so it never
-    // blocks mouse or keyboard input; it is only a visual cue. Added to
-    // top chrome BEFORE the pill so the pill (added later) draws on top.
-    // St.Actor is not in this build's curated St typelib, so use
-    // St.Widget, as the shell itself does for its own stage actors.
+    // Full-screen dim shown while recording; while up it is also the input
+    // surface for mid-dictation erase/undo (see the header). Added to top
+    // chrome BEFORE the pill so the pill (added later) draws on top.
+    // `reactive` is toggled on only while recording (see _setState); when
+    // idle the overlay is hidden and captures nothing. St.Actor is not in
+    // this build's curated St typelib, so use St.Widget, as the shell
+    // itself does for its own stage actors.
     this._overlay = new St.Widget({
       style: OVERLAY_STYLE,
       reactive: false,
     });
     this._overlay.hide();
+    this._overlay.connect('button-press-event', (actor, event) => {
+      if (!this._recording)
+        return Clutter.EVENT_PROPAGATE;
+      const button = event.get_button();
+      if (button === Clutter.BUTTON_PRIMARY) {
+        this._callErase();
+        return Clutter.EVENT_STOP;
+      }
+      if (button === Clutter.BUTTON_SECONDARY) {
+        this._callUndo();
+        return Clutter.EVENT_STOP;
+      }
+      return Clutter.EVENT_PROPAGATE;
+    });
     Main.layoutManager.addTopChrome(this._overlay);
 
     Main.layoutManager.addTopChrome(this._pill);
@@ -165,13 +182,9 @@ SayTypeHUD.prototype = {
       (p, sender, [state]) => {
         this._setState(state === 'Recording');
       }));
-    this._conns.push(proxy.connectSignal('PartialTranscribed',
+    this._conns.push(proxy.connectSignal('TranscriptUpdated',
       (p, sender, [text]) => {
-        this._setPartial(text);
-      }));
-    this._conns.push(proxy.connectSignal('SegmentTranscribed',
-      (p, sender, [text]) => {
-        this._appendFinal(text);
+        this._setTranscript(text);
       }));
 
     // The proxy reports loss of the name owner (daemon died) so a stale
@@ -217,8 +230,9 @@ SayTypeHUD.prototype = {
     if (this._recording === recording)
       return;
     this._recording = recording;
-    this._committed = '';
-    this._partial = '';
+    this._transcript = '';
+    // Capture mouse presses for erase/undo only while a session is live.
+    this._overlay.set_reactive(recording);
     this._updateLabel();
     if (recording) {
       this._layoutOverlay();
@@ -235,31 +249,19 @@ SayTypeHUD.prototype = {
     }
   },
 
-  // A live partial for the utterance in progress; it replaces the current
-  // tail and is superseded by the next partial or the segment final.
-  _setPartial(text) {
+  // The daemon's authoritative visible transcript (committed finals plus
+  // the live partial, erasures applied, casing/punctuation restored).
+  // Replaces whatever the pill currently shows.
+  _setTranscript(text) {
     if (!this._recording)
       return;
-    this._partial = text;
-    this._updateLabel();
-    this._queueReposition();
-  },
-
-  // A committed final: append to the transcript and clear the live tail.
-  _appendFinal(text) {
-    if (!this._recording)
-      return;
-    this._committed = this._committed ? this._committed + ' ' + text : text;
-    this._partial = '';
+    this._transcript = text;
     this._updateLabel();
     this._queueReposition();
   },
 
   _updateLabel() {
-    let shown = this._committed;
-    if (this._partial)
-      shown = shown ? shown + ' ' + this._partial : this._partial;
-    this._label.set_text(shown || IDLE_LABEL);
+    this._label.set_text(this._transcript || IDLE_LABEL);
   },
 
   _layoutOverlay() {
@@ -358,11 +360,21 @@ SayTypeHUD.prototype = {
       this._mic.opacity = 255;
   },
 
-  _callToggle() {
+  // Erase the last visible word (left mouse press while recording).
+  _callErase() {
     if (!this._proxy)
       return;
-    this._proxy.ToggleAsync().catch(e => {
-      log(`saytype-hud: Toggle failed (daemon running?): ${e.message}`);
+    this._proxy.EraseWordAsync().catch(e => {
+      log(`saytype-hud: EraseWord failed (daemon running?): ${e.message}`);
+    });
+  },
+
+  // Restore the last erased word (right mouse press while recording).
+  _callUndo() {
+    if (!this._proxy)
+      return;
+    this._proxy.UndoEraseAsync().catch(e => {
+      log(`saytype-hud: UndoErase failed (daemon running?): ${e.message}`);
     });
   },
 };

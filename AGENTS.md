@@ -24,27 +24,38 @@ Pipeline per dictation session:
   It runs inside gnome-shell (gjs), not in our process: a plain D-Bus client
   with no audio and no models. While recording it draws a dim overlay across
   all monitors plus a pill that follows the mouse pointer (so it is visible
-  on any screen); being shell-stage artwork it never steals focus and behaves
-  identically on X11 and Wayland. Installed with
-  `scripts/install-extension.sh`.
+  on any screen) and renders the daemon's authoritative `TranscriptUpdated`
+  verbatim; being shell-stage artwork it never steals keyboard focus and
+  behaves identically on X11 and Wayland. While recording the overlay is also
+  the mouse input surface for mid-dictation word erase/undo (LEFT press
+  erases, RIGHT press restores -> `EraseWord`/`UndoErase`); start/stop stays
+  the custom hotkey. Installed with `scripts/install-extension.sh`.
 - IPC is the session D-Bus bus:
   - Bus name `io.saytype.Dictate`, path `/io/saytype/Dictate`, interface `io.saytype.Dictate1`
-  - Methods: `Toggle()`, `Stop()`
-  - Signals: `StateChanged(String)`, `PartialTranscribed(String)`, `SegmentTranscribed(String)`
+  - Methods: `Toggle()`, `Stop()`, `EraseWord()`, `UndoErase()`
+  - Signals: `StateChanged(String)`, `PartialTranscribed(String)`,
+    `SegmentTranscribed(String)`, `TranscriptUpdated(String)`
   - `PartialTranscribed` is a live hypothesis for the utterance in progress
     (streaming backend only); `SegmentTranscribed` is the committed final.
+  - `EraseWord()`/`UndoErase()` (mid-dictation, driven by mouse buttons)
+    pop/restore the last visible word of the running session (no-op when
+    idle). `TranscriptUpdated(String)` carries the full visible transcript
+    (committed finals + live partial, erasures applied, casing/punctuation
+    restored); the HUD renders it verbatim and the daemon re-sends it after
+    every change (partial, final, erase, undo).
 
 ## File map
 
 | File | What to find there |
 |---|---|
 | `src/main.rs` | CLI dispatch (daemon / `--transcribe <wav>` / `--vad-test <wav>` / `--stream-test <wav>`, all take `--asr`), models-dir resolution, logging |
-| `src/daemon.rs` | D-Bus service, `Engine` state machine (Idle/Recording), per-session pipeline: `stream_task` (streaming) or `vad_task`+`asr_task` (batch), `injector_task`; `EngineEvent`/`AsrOutput` |
+| `src/daemon.rs` | D-Bus service (`Toggle`/`Stop`/`EraseWord`/`UndoErase` + signals), `Engine` state machine (Idle/Recording), per-session pipeline: `stream_task` (streaming) or `vad_task`+`asr_task` (batch), `injector_task` (owns the session's `Transcript`, applies erase/undo, emits `TranscriptUpdated`); `EngineEvent`/`AsrOutput`/`InjectorInput` |
 | `src/audio.rs` | PipeWire capture on a dedicated OS thread; S16LE 16 kHz mono in, f32 frames out via mpsc |
 | `src/vad.rs` | Silero VAD wrapper, `detected()` in-progress probe, `VadParams` defaults, `AudioRing` context-padding buffer (batch path) + unit tests |
 | `src/asr.rs` | `Asr` tri-backend (Nemotron streaming `OnlineRecognizer` preferred, Zipformer `OnlineRecognizer` fallback, Moonshine `OfflineRecognizer` batch), `BackendSelection`/`AsrKind`, `StreamingSession` (feed/partial/commit), batch `transcribe()`, `polish()` (lowercase + strip punct + online punct) output policy, optional `OnlinePunctuation` model auto-detect |
 | `src/injector.rs` | ydotool typing (`type_text`, `backspaces`), `diff` prefix-diff, `capitalize_first` MVP punctuation stand-in + tests |
-| `extension/saytype@saytype.local/` | GNOME Shell extension HUD (gjs, ESM-first): D-Bus proxy client, pointer-following pill + dim overlay (inline St styles, emoji mic), committed+partial transcript, `metadata.json` |
+| `src/transcript.rs` | Pure `Transcript` state machine: single source of truth for the visible text (committed finals + live partial) with mid-dictation word erase/undo (LIFO undo stack), position-based partial-erasure tracking across decoder revisions, new-word-makes-erase-permanent rule, `display()` (HUD) + `buffer_target()` (target buffer) + unit tests |
+| `extension/saytype@saytype.local/` | GNOME Shell extension HUD (gjs, ESM-first): D-Bus proxy client, pointer-following pill + dim overlay (inline St styles, emoji mic) rendering the authoritative `TranscriptUpdated`; while recording the overlay is the input surface for LEFT=erase / RIGHT=undo (`EraseWord`/`UndoErase`); `metadata.json` |
 | `models/` | `silero_vad.onnx` + ASR model dirs (Nemotron streaming preferred, Zipformer + Moonshine v2 fallbacks) + optional online punct dir; gitignored; default install has only the Nemotron stack |
 | `systemd/saytype.service` | Unit template with `@REPO@`/`@BIN@` placeholders |
 | `scripts/setup-ydotool.sh` | One-time: apt ydotool, udev rule for `/dev/uinput`, `ydotoold` user service |
