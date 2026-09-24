@@ -3,5 +3,6 @@
   "name": "SayType HUD",
   "description": "Focus-free dictation HUD for the saytype background dictation daemon",
   "version": "0.1.0",
-  "shell-version": ["46"]
+  "shell-version": ["46"],
+  "settings-schema": "org.gnome.shell.extensions.saytype"
 }

@@ -10,7 +10,7 @@ name = "saytype"
 path = "src/main.rs"
 
 [dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "process"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "process", "io-util"] }
 zbus = "4.4"
 pipewire = { version = "0.10", features = ["v1_0_0"] }
 sherpa-onnx = "1.13"

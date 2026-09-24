@@ -48,7 +48,11 @@ fn runtime() -> tokio::runtime::Runtime {
 
 fn run_daemon(args: &[String]) {
     let (rest, selection) = parse_asr_selection(args);
-    let live_typing = !args.iter().any(|a| a == "--no-live-typing");
+    let typing_mode = parse_typing_mode(&rest);
+    let rest: Vec<String> = rest
+        .into_iter()
+        .filter(|a| a != "--live-typing" && a != "--no-live-typing")
+        .collect();
     if !rest.is_empty() {
         eprintln!("daemon takes no positional arguments (got {:?})", rest[0]);
         std::process::exit(2);
@@ -57,11 +61,28 @@ fn run_daemon(args: &[String]) {
     let rt = runtime();
     rt.block_on(async move {
         init_logging();
-        if let Err(e) = daemon::run(&models, selection, live_typing).await {
+        if let Err(e) = daemon::run(&models, selection, typing_mode).await {
             tracing::error!("daemon failed: {e:?}");
             std::process::exit(1);
         }
     });
+}
+
+/// Parse the typing-mode flags out of a daemon subcommand's remaining args
+/// (after `--asr` has already been stripped by `parse_asr_selection`),
+/// returning the mode and (via `retain`) removing the flags so leftover
+/// positional-argument validation still works. Default: `Deferred` -
+/// nothing is typed into the target app until the session stops, so
+/// mid-dictation erase/undo never touches whatever real app has focus
+/// while you are still speaking.
+fn parse_typing_mode(args: &[String]) -> daemon::TypingMode {
+    if args.iter().any(|a| a == "--live-typing") {
+        daemon::TypingMode::Live
+    } else if args.iter().any(|a| a == "--no-live-typing") {
+        daemon::TypingMode::FinalOnly
+    } else {
+        daemon::TypingMode::Deferred
+    }
 }
 
 /// Parse `--asr <auto|streaming|zipformer|moonshine>` out of a subcommand's
@@ -217,6 +238,33 @@ fn drain_commits(
     }
 }
 
+/// Offline injector check: `saytype --paste-test "<text>"`. Exercises the
+/// exact real subprocess chain `injector::paste_text` uses (clipboard set
+/// via `xclip`/`wl-copy`, then `ydotool key ctrl+v`) in the real tokio
+/// runtime, timed - a direct regression check for a real bug where `xclip`
+/// hung under the daemon's actual process context (not reproducible
+/// testing `xclip` standalone from an interactive shell) until
+/// `run_with_stdin` stopped waiting for it to fully exit.
+fn run_paste_test(args: &[String]) {
+    if args.is_empty() {
+        eprintln!("usage: saytype --paste-test \"<text>\"");
+        std::process::exit(2);
+    }
+    let text = args.join(" ");
+    let rt = runtime();
+    rt.block_on(async move {
+        init_logging();
+        let start = std::time::Instant::now();
+        match injector::paste_text(&text).await {
+            Ok(()) => println!("paste_text OK in {:?}", start.elapsed()),
+            Err(e) => {
+                eprintln!("paste_text FAILED in {:?}: {e}", start.elapsed());
+                std::process::exit(1);
+            }
+        }
+    });
+}
+
 /// Offline streaming check: `saytype --stream-test [--asr streaming] <file.wav>`
 /// (16 kHz mono). Replays the file headlessly through the same pieces the
 /// live pipeline uses - a VAD for commit boundaries and one continuous
@@ -303,22 +351,31 @@ fn main() {
         Some("--transcribe") => run_transcribe(&args[2..]),
         Some("--vad-test") => run_vad_test(&args[2..]),
         Some("--stream-test") => run_stream_test(&args[2..]),
+        Some("--paste-test") => run_paste_test(&args[2..]),
         Some("--help") | Some("-h") => {
             println!(
                 "saytype - background speech-to-text dictation daemon\n\n\
                    usage:\n  \
-                   saytype [--asr <sel>] [--no-live-typing]\n  \
+                   saytype [--asr <sel>] [--live-typing | --no-live-typing]\n  \
                    \t                run the D-Bus daemon (systemd user service)\n  \
                    saytype --transcribe [--asr <sel>] <wav>\n  \
                    \t                  offline ASR check (16 kHz mono WAV)\n  \
                    saytype --vad-test <wav>         offline VAD check (16 kHz mono WAV)\n  \
                     saytype --stream-test [--asr streaming] <wav>\n  \
-                    \t                  offline streaming replay: partials + committed finals\n\n\
+                    \t                  offline streaming replay: partials + committed finals\n  \
+                    saytype --paste-test <text>\n  \
+                    \t                  offline injector check: clipboard set + ydotool paste\n\n\
                     <sel> = auto | streaming | zipformer | moonshine\n  \
                     \t      auto = best available (nemotron > zipformer > moonshine)\n  \
-                    \t      streaming = best streaming backend (nemotron > zipformer)\n  \
-                    --no-live-typing   type only committed finals (MVP1 behavior),\n  \
-                    \t\t\t\t   no live partial typing into the target app"
+                    \t      streaming = best streaming backend (nemotron > zipformer)\n\n\
+                    typing mode (default: deferred - nothing is typed into the target\n  \
+                    app until the session stops; erase/undo only affect the HUD while\n  \
+                    recording, so they never touch a real app's live buffer):\n  \
+                    --live-typing      type partials live as they stabilize (mvp2\n  \
+                    \t\t\t   behavior); erase/undo edit the live-typed buffer too\n  \
+                    --no-live-typing   type only committed finals, immediately, one\n  \
+                    \t\t\t   chunk per utterance (MVP1 behavior); erase/undo edit\n  \
+                    \t\t\t   the live-typed buffer too"
             );
         }
         // Daemon with a flag: `saytype --asr <sel>`.
@@ -328,5 +385,28 @@ fn main() {
             std::process::exit(2);
         }
         None => run_daemon(&args[1..]),
+    }
+}
+
+#[cfg(test)]
+mod typing_mode_tests {
+    use super::*;
+
+    #[test]
+    fn defaults_to_deferred() {
+        let args: Vec<String> = vec![];
+        assert_eq!(parse_typing_mode(&args), daemon::TypingMode::Deferred);
+    }
+
+    #[test]
+    fn live_typing_flag_selects_live() {
+        let args: Vec<String> = vec!["--live-typing".to_string()];
+        assert_eq!(parse_typing_mode(&args), daemon::TypingMode::Live);
+    }
+
+    #[test]
+    fn no_live_typing_flag_selects_final_only() {
+        let args: Vec<String> = vec!["--no-live-typing".to_string()];
+        assert_eq!(parse_typing_mode(&args), daemon::TypingMode::FinalOnly);
     }
 }

@@ -85,8 +85,22 @@ pub enum EngineCmd {
     Undo,
 }
 
+/// Minimum gap between two accepted `Toggle()` calls. GNOME custom
+/// shortcuts fire again on X11 key auto-repeat if the hotkey is held even
+/// slightly past the initial repeat delay - each repeat spawns a whole new
+/// `saytype-toggle` process and D-Bus call, which without this guard could
+/// flood the engine with a burst of toggles (observed: 8 calls in ~4s from
+/// a single physical press) that flip Recording/Idle repeatedly and can
+/// land back on the wrong state - looking like "the HUD doesn't close".
+/// A human deliberately toggling twice is essentially never this fast; a
+/// hardware auto-repeat burst is always this fast. Debouncing here (at the
+/// D-Bus method, closest to the input source) rejects repeats before they
+/// ever reach the engine queue, regardless of what is bound to the hotkey.
+const TOGGLE_DEBOUNCE: Duration = Duration::from_millis(350);
+
 pub struct Dictate {
     cmd_tx: mpsc::UnboundedSender<EngineCmd>,
+    last_toggle: std::sync::Mutex<Option<std::time::Instant>>,
 }
 
 /// D-Bus interface. The methods must not do real work here: zbus dispatches
@@ -96,6 +110,16 @@ pub struct Dictate {
 #[interface(name = "io.saytype.Dictate1")]
 impl Dictate {
     async fn toggle(&mut self) {
+        let now = std::time::Instant::now();
+        let mut last = self.last_toggle.lock().expect("last_toggle mutex poisoned");
+        if let Some(prev) = *last {
+            if now.duration_since(prev) < TOGGLE_DEBOUNCE {
+                tracing::debug!("ignoring Toggle(): debounced (hotkey auto-repeat?)");
+                return;
+            }
+        }
+        *last = Some(now);
+        drop(last);
         let _ = self.cmd_tx.send(EngineCmd::Toggle);
     }
 
@@ -130,7 +154,10 @@ impl Dictate {
 
 impl Dictate {
     pub fn new(cmd_tx: mpsc::UnboundedSender<EngineCmd>) -> Self {
-        Self { cmd_tx }
+        Self {
+            cmd_tx,
+            last_toggle: std::sync::Mutex::new(None),
+        }
     }
 }
 
@@ -156,10 +183,37 @@ pub struct Engine {
     vad_config: VadConfig,
     asr: std::sync::Arc<Asr>,
     events: mpsc::UnboundedSender<EngineEvent>,
-    /// Live typing of partials into the target app (off via
-    /// `--no-live-typing`; only meaningful for the streaming backend).
-    live_typing: bool,
+    /// How/when transcribed text reaches the target app (default
+    /// `Deferred`; see [`TypingMode`]).
+    typing_mode: TypingMode,
     session: Option<Session>,
+}
+
+/// How/when transcribed text is injected into the target app during a
+/// session. Independent of what the HUD shows: `TranscriptUpdated` always
+/// carries the live transcript (partials, finals, erase/undo applied)
+/// regardless of mode, since the HUD has its own focus-free overlay.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TypingMode {
+    /// Type partials into the target app as soon as they are stable (see
+    /// `STABILITY_PARTIALS`), corrected with backspaces as the decoder
+    /// revises the tail; each `Final` converges the buffer to the
+    /// committed text. Mid-dictation erase/undo edit the already-typed
+    /// buffer live, via backspaces, in the target app - so an erase/undo
+    /// touches whatever real app currently has focus while you dictate.
+    Live,
+    /// Type only committed finals, immediately, one chunk per utterance
+    /// (no partial typing; the MVP1 behavior). Erase/undo still edit the
+    /// already-typed buffer live, same as `Live`.
+    FinalOnly,
+    /// Type nothing into the target app while the session is recording:
+    /// only the HUD overlay shows the live transcript, so speaking and
+    /// correcting with erase/undo never touches whatever real app has
+    /// focus. The whole accumulated (post-erase/undo) transcript is typed
+    /// into the target app exactly once, when the session stops. This is
+    /// the default: it is what makes erase/undo safe to use without
+    /// racing a live buffer in some other application.
+    Deferred,
 }
 
 struct Session {
@@ -204,7 +258,7 @@ impl Engine {
         models_dir: &Path,
         events: mpsc::UnboundedSender<EngineEvent>,
         selection: BackendSelection,
-        live_typing: bool,
+        typing_mode: TypingMode,
     ) -> Result<Self> {
         crate::vad::check_model_file(&models_dir.join("silero_vad.onnx"))?;
         crate::asr::check_models_dir(models_dir)?;
@@ -227,7 +281,7 @@ impl Engine {
             vad_config: VadConfig::from_models_dir(models_dir),
             asr: std::sync::Arc::new(asr),
             events,
-            live_typing,
+            typing_mode,
             session: None,
         })
     }
@@ -289,10 +343,7 @@ impl Engine {
 
         let events = self.events.clone();
         let streaming = self.asr.is_streaming();
-        // Live typing only makes sense with a streaming backend (they alone
-        // produce partials); the batch backend always types finals only.
-        let live_typing = self.live_typing && streaming;
-        let inj_task = tokio::spawn(injector_task(out_rx, events, live_typing, streaming));
+        let inj_task = tokio::spawn(injector_task(out_rx, events, self.typing_mode, streaming));
 
         self.session = Some(Session {
             capture,
@@ -325,8 +376,22 @@ impl Engine {
 
         // Audio gone: the pipeline flushes its trailing utterance and exits.
         session.pipeline.wait().await;
-        // Injector drains the remaining outputs.
-        let _ = tokio::time::timeout(Duration::from_secs(30), session.inj_task).await;
+        // Drop our own sender clone before awaiting the injector: it also
+        // holds a clone (for mid-session erase/undo commands), so the
+        // injector's receive loop only sees the channel close once both
+        // the pipeline's sender (dropped above) and this one are gone.
+        // Keeping it alive across the join would deadlock the drain until
+        // the timeout, delaying the Idle StateChanged (and the HUD hiding)
+        // by the full duration on every stop.
+        drop(session.inj_tx);
+        // Injector drains the remaining outputs. Every subprocess call inside
+        // it (ydotool, xclip/wl-copy) is now individually bounded (see
+        // `injector::SUBPROCESS_TIMEOUT`, 5s), so this is a safety net for
+        // something unforeseen, not the primary bound - it used to be 30s,
+        // and a hang anywhere in the injector (observed live: the one-shot
+        // deferred paste) meant the HUD stayed visibly stuck on screen for
+        // the whole 30s before `StateChanged("Idle")` could be sent.
+        let _ = tokio::time::timeout(Duration::from_secs(12), session.inj_task).await;
         session.capture.join();
 
         let _ = self.events.send(EngineEvent::StateChanged("Idle".into()));
@@ -589,30 +654,28 @@ impl LiveTyping {
 /// Injector: single consumer, strictly serialized ydotool calls.
 ///
 /// Owns the session's [`Transcript`], the single source of truth for what
-/// the target buffer holds and what the HUD shows. With `live_typing`
-/// (streaming backend without `--no-live-typing`): partials are typed into
-/// the target app as soon as they are stable (see `STABILITY_PARTIALS`),
-/// corrected with backspaces when the decoder revises the tail; each
-/// `Final` converges the buffer to the committed text. Without it (batch
-/// backend, or `--no-live-typing`): only finals are typed - one chunk per
-/// committed utterance, the MVP1 behavior. Mid-dictation erase/undo
-/// commands (mouse buttons) apply to the transcript and converge the
-/// buffer. The raw ASR text is always relayed to the HUD, and the visible
-/// transcript (erasures applied) is re-sent after every change.
+/// the target buffer holds and what the HUD shows. `typing_mode` (see
+/// [`TypingMode`]) controls *when* that text reaches the target app; the
+/// HUD, via `TranscriptUpdated`, always reflects it immediately regardless
+/// of mode. In `Deferred` mode (the default) nothing is typed while the
+/// loop runs; the whole final transcript is typed once, after the loop
+/// ends (`out_rx` closed: the session is stopping and every sender,
+/// including mid-session erase/undo commands, has been dropped).
 async fn injector_task(
     mut out_rx: mpsc::Receiver<InjectorInput>,
     events: mpsc::UnboundedSender<EngineEvent>,
-    live_typing: bool,
+    typing_mode: TypingMode,
     streaming: bool,
 ) {
     let mut live = LiveTyping::new();
     let mut transcript = Transcript::new();
+    let deferred = typing_mode == TypingMode::Deferred;
     while let Some(input) = out_rx.recv().await {
         match input {
             InjectorInput::Asr(AsrOutput::Partial(text)) => {
                 let _ = events.send(EngineEvent::PartialTranscribed(text.clone()));
                 transcript.feed_partial(&text);
-                if live_typing {
+                if typing_mode == TypingMode::Live {
                     live.push_partial(&text);
                     if let Some(target) = live.stable_target(&transcript) {
                         if let Err(e) = live.apply(&target).await {
@@ -625,39 +688,64 @@ async fn injector_task(
                 let _ = events.send(EngineEvent::TranscriptUpdated(transcript.display()));
             }
             InjectorInput::Asr(AsrOutput::Final(text)) => {
-                // Convergence: type whatever makes the buffer exactly the
-                // committed text (an extension in the common case;
-                // backspaces + retype when the final differs from the last
-                // partial), then reset for the next segment.
                 if streaming {
                     transcript.feed_final(&text);
                 } else {
                     transcript.feed_batch_final(&text);
                 }
-                let target = transcript.buffer_target("");
-                let ok = live.apply(&target).await.is_ok();
-                if !ok {
-                    tracing::error!("ydotool failed to type final: {text:?}");
-                }
-                live.commit_segment();
-                let event = if ok {
+                let event = if deferred {
+                    // Nothing is typed yet; the segment is only committed
+                    // to the transcript. The whole thing is typed once, at
+                    // session stop.
                     text
                 } else {
-                    format!("[type failed] {text}")
+                    // Convergence: type whatever makes the buffer exactly
+                    // the committed text (an extension in the common case;
+                    // backspaces + retype when the final differs from the
+                    // last partial), then reset for the next segment.
+                    let target = transcript.buffer_target("");
+                    let ok = live.apply(&target).await.is_ok();
+                    if !ok {
+                        tracing::error!("ydotool failed to type final: {text:?}");
+                    }
+                    if ok {
+                        text
+                    } else {
+                        format!("[type failed] {text}")
+                    }
                 };
+                live.commit_segment();
                 let _ = events.send(EngineEvent::SegmentTranscribed(event));
                 let _ = events.send(EngineEvent::TranscriptUpdated(transcript.display()));
             }
             InjectorInput::Erase => {
                 if transcript.erase_last() {
-                    apply_transcript_change(&mut live, &transcript, &events, "erased").await;
+                    apply_transcript_change(&mut live, &transcript, &events, typing_mode, "erased")
+                        .await;
                 }
             }
             InjectorInput::Undo => {
                 if transcript.undo_last() {
-                    apply_transcript_change(&mut live, &transcript, &events, "restored").await;
+                    apply_transcript_change(
+                        &mut live, &transcript, &events, typing_mode, "restored",
+                    )
+                    .await;
                 }
             }
+        }
+    }
+    if deferred {
+        // Session stopping: paste the whole accumulated (post-erase/undo)
+        // transcript exactly once (clipboard + Ctrl+V, not a simulated
+        // keystroke-per-character type: it lands instantly instead of
+        // visibly "typing itself out", and never fires the target app's
+        // per-keystroke handlers for text the user never watched arrive).
+        // By now every utterance has committed (the pipeline flushes its
+        // trailing speech before this task's senders are dropped), so
+        // `display()` is pure committed text.
+        let target = transcript.display();
+        if let Err(e) = injector::paste_text(&target).await {
+            tracing::error!("deferred paste failed: {e}");
         }
     }
 }
@@ -665,18 +753,22 @@ async fn injector_task(
 /// After a mid-dictation erase/undo: converge the target buffer to the
 /// transcript's current visible state (the stable prefix of the live
 /// partial when there is one, else the committed text) and relay the
-/// display to the HUD.
+/// display to the HUD. In `Deferred` mode nothing is typed yet, so only
+/// the HUD is updated.
 async fn apply_transcript_change(
     live: &mut LiveTyping,
     transcript: &Transcript,
     events: &mpsc::UnboundedSender<EngineEvent>,
+    typing_mode: TypingMode,
     what: &str,
 ) {
-    let target = live
-        .stable_target(transcript)
-        .unwrap_or_else(|| transcript.buffer_target(""));
-    if let Err(e) = live.apply(&target).await {
-        tracing::error!("buffer convergence after {what} word failed: {e}");
+    if typing_mode != TypingMode::Deferred {
+        let target = live
+            .stable_target(transcript)
+            .unwrap_or_else(|| transcript.buffer_target(""));
+        if let Err(e) = live.apply(&target).await {
+            tracing::error!("buffer convergence after {what} word failed: {e}");
+        }
     }
     tracing::info!("{what} word, transcript: {:?}", transcript.display());
     let _ = events.send(EngineEvent::TranscriptUpdated(transcript.display()));
@@ -686,10 +778,10 @@ async fn apply_transcript_change(
 pub async fn run(
     models_dir: &Path,
     selection: BackendSelection,
-    live_typing: bool,
+    typing_mode: TypingMode,
 ) -> Result<()> {
     let (events_tx, mut events_rx) = mpsc::unbounded_channel::<EngineEvent>();
-    let engine = Engine::load(models_dir, events_tx, selection, live_typing).await?;
+    let engine = Engine::load(models_dir, events_tx, selection, typing_mode).await?;
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<EngineCmd>();
 
     // The engine loop owns the Engine and runs on this tokio runtime.
@@ -870,5 +962,85 @@ mod tests {
         // up exactly at it.
         t.feed_final("the quick brown");
         assert_eq!(t.buffer_target(""), "The quick brown");
+    }
+}
+
+#[cfg(test)]
+mod double_erase_regression {
+    //! Regression coverage for a real bug: two Left-arrow presses in quick
+    //! succession during live dictation could silently erase the wrong
+    //! word (or none at all) and desync the undo stack from what was
+    //! visibly typed. Root cause: `Transcript::feed_partial` used to treat
+    //! any growth in the decoder's live hypothesis as "the user kept
+    //! talking" and permanently retired pending erasures on the spot -
+    //! but `saytype --stream-test` on a real recording shows the streaming
+    //! decoder grows its partial roughly every 500-600ms *continuously*
+    //! while speaking, which is well within human key-press cadence. A
+    //! press, then one ordinary decoder tick, then a second press would
+    //! make the first erasure permanent and retarget the second press at
+    //! whatever word just streamed in, not the word the user meant.
+
+    use super::*;
+
+    fn tick(live: &mut LiveTyping, t: &mut Transcript, text: &str) {
+        t.feed_partial(text);
+        live.push_partial(text);
+    }
+
+    #[test]
+    fn double_erase_without_intervening_tick() {
+        let mut live = LiveTyping::new();
+        let mut t = Transcript::new();
+        tick(&mut live, &mut t, "the quick brown fox");
+        tick(&mut live, &mut t, "the quick brown fox");
+        assert_eq!(live.stable_target(&t), Some("The quick brown fox".to_string()));
+        assert!(t.erase_last());
+        assert!(t.erase_last());
+        assert_eq!(t.display(), "the quick");
+        assert_eq!(live.stable_target(&t), Some("The quick".to_string()));
+    }
+
+    // A VAD auto-commit (0.8s pause) lands between the user's two presses:
+    // press 1 erases "fox" (pending, mid-partial), the pause auto-commits
+    // the utterance, then press 2 arrives. It must still target "brown".
+    #[test]
+    fn erase_commit_erase_targets_the_right_word() {
+        let mut live = LiveTyping::new();
+        let mut t = Transcript::new();
+        tick(&mut live, &mut t, "the quick brown fox");
+        tick(&mut live, &mut t, "the quick brown fox");
+        assert!(t.erase_last()); // "fox" pending-erased
+        t.feed_final("the quick brown fox"); // same tokens: no growth
+        live.commit_segment();
+        assert_eq!(t.display(), "The quick brown");
+        assert!(t.erase_last()); // press 2: must erase "brown", not "fox"
+        assert_eq!(t.display(), "The quick");
+    }
+
+    // The regression itself: a new word streams in between the user's two
+    // presses purely from ordinary decoder cadence (not a deliberate new
+    // utterance). Whichever word each press actually lands on (that is
+    // inherently racy against a live decoder), neither erasure may be
+    // silently made permanent, and both must stay undoable, LIFO.
+    #[test]
+    fn erase_twice_survives_a_decoder_tick_in_between() {
+        let mut live = LiveTyping::new();
+        let mut t = Transcript::new();
+        tick(&mut live, &mut t, "the quick brown fox");
+        tick(&mut live, &mut t, "the quick brown fox");
+        assert!(t.erase_last()); // press 1: "fox" pending-erased
+        assert_eq!(t.display(), "the quick brown");
+        // One ordinary decoder tick with a new word, before press 2 lands.
+        tick(&mut live, &mut t, "the quick brown fox jumps");
+        // "fox" must still be pending (not silently made permanent), still
+        // hidden from the now-longer partial.
+        assert_eq!(t.display(), "the quick brown jumps");
+        assert!(t.erase_last()); // press 2: erases the new tail, "jumps"
+        assert_eq!(t.display(), "the quick brown");
+        // Both erasures are still restorable, LIFO.
+        assert!(t.undo_last());
+        assert_eq!(t.display(), "the quick brown jumps");
+        assert!(t.undo_last());
+        assert_eq!(t.display(), "the quick brown fox jumps");
     }
 }

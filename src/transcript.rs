@@ -3,16 +3,19 @@
 //! The single source of truth for what text the target app should contain
 //! and what the HUD should show, with mid-dictation word erase/undo applied:
 //!
-//! - `erase_last` (left mouse press) removes the last visible word: from
+//! - `erase_last` (Left arrow key) removes the last visible word: from
 //!   the live partial if an utterance is in progress, else from the tail of
 //!   the committed text.
-//! - `undo_last` (right mouse press) restores the most recently erased word
+//! - `undo_last` (Right arrow key) restores the most recently erased word
 //!   (LIFO: multiple erases are undone one by one in reverse order), putting
 //!   it back at its **original position** in the text.
-//! - An erase is restorable only until the next **new word** is transcribed:
-//!   a partial that grows beyond any earlier partial of the utterance, or
-//!   a final containing words no partial showed. From then on the word is
-//!   gone for good (not restorable), matching "the user kept talking".
+//! - An erase stays restorable for the rest of the utterance in progress,
+//!   however much the decoder's hypothesis grows tick to tick (that
+//!   happens continuously as speech streams in and is not itself "new
+//!   speech" worth losing an undo over - see `feed_partial`). It is
+//!   retired for good only at an utterance **boundary**: this utterance's
+//!   own final containing content no partial of it ever showed, or the
+//!   *next* utterance moving past it, matching "the user kept talking".
 //!
 //! Erased words are tracked two ways, because a word can be erased while it
 //! is still only a live hypothesis or after it has committed:
@@ -67,9 +70,17 @@ pub struct Transcript {
     /// The latest partial's tokens (the utterance in progress); empty
     /// between finals.
     partial_tokens: Vec<String>,
-    /// The most tokens any partial of this utterance has had so far. A
-    /// partial (or final) beyond it contains new words and makes pending
-    /// erasures permanent.
+    /// Whether an utterance is currently in progress (set on the first
+    /// `feed_partial` after a reset, cleared by `feed_final`/
+    /// `feed_batch_final`). Distinct from `partial_tokens.is_empty()`,
+    /// which a decoder revision could also produce transiently mid-
+    /// utterance; this flag exists solely to mark the *boundary* where any
+    /// erasures still pending from the previous utterance become
+    /// permanent.
+    utterance_active: bool,
+    /// The most tokens any partial of this utterance has had so far, used
+    /// by `feed_final` to tell a same-utterance revision from a final
+    /// containing content no partial of this utterance ever showed.
     partial_max_tokens: usize,
     /// Token positions permanently erased in the current utterance (never
     /// shown again, not restorable). Disjoint with the `Partial` entries of
@@ -164,13 +175,29 @@ impl Transcript {
 
     /// Feed a live partial (streaming path). Returns the visible partial.
     ///
-    /// A partial with more tokens than any earlier partial of this
-    /// utterance contains new words: pending erasures become permanent
-    /// first, so the new words appear without the erased ones.
+    /// Pending erasures stay restorable for the whole utterance in
+    /// progress, however long the decoder's hypothesis grows tick to tick
+    /// (that happens continuously, roughly every ASR chunk, and is not
+    /// itself "the user kept talking" in any way worth losing an undo
+    /// over). What *does* retire a pending erasure is a genuine utterance
+    /// boundary: this utterance's own final containing content no partial
+    /// of it ever showed (below), or - here - the very first partial of
+    /// the *next* utterance, which flushes whatever erasures are still
+    /// pending from the previous (already committed) one, signalled by the
+    /// `utterance_active` flag (not `partial_tokens.is_empty()`, which a
+    /// decoder revision could also produce transiently mid-utterance). At
+    /// that boundary `undo` can only hold `Undo::Committed` entries: a
+    /// same-utterance `Undo::Partial` never survives past its own
+    /// `feed_final`. `partial_max_tokens` tracks the high water mark so
+    /// `feed_final` can tell a same-utterance revision from content no
+    /// partial of this utterance ever showed.
     pub fn feed_partial(&mut self, text: &str) -> String {
+        if !self.utterance_active {
+            self.flush_undos();
+            self.utterance_active = true;
+        }
         let tokens = Self::tokens(text);
         if tokens.len() > self.partial_max_tokens {
-            self.flush_undos();
             self.partial_max_tokens = tokens.len();
         }
         self.partial_tokens = tokens;
@@ -218,6 +245,7 @@ impl Transcript {
 
         // Start a fresh utterance.
         self.partial_tokens.clear();
+        self.utterance_active = false;
         self.partial_max_tokens = 0;
         self.erased.clear();
         self.undo = converted;
@@ -229,6 +257,7 @@ impl Transcript {
     pub fn feed_batch_final(&mut self, text: &str) {
         self.flush_undos();
         self.partial_tokens.clear();
+        self.utterance_active = false;
         self.partial_max_tokens = 0;
         self.erased.clear();
         let tokens = Self::tokens(text);
@@ -419,16 +448,18 @@ mod tests {
     }
 
     #[test]
-    fn new_word_makes_partial_erasure_permanent() {
+    fn erase_stays_restorable_across_mid_utterance_growth() {
         let mut t = Transcript::new();
         t.feed_partial("the quick brown");
         assert!(t.erase_last());
         assert_eq!(t.display(), "the quick");
-        // A new word ("fox") is transcribed: "brown" is gone for good,
-        // even though the decoder still emits it.
+        // A new word ("fox") streams in: this is normal decoder cadence
+        // mid-utterance, not "the user kept talking" in the sense that
+        // should burn an undo - the erasure must stay restorable.
         t.feed_partial("the quick brown fox");
         assert_eq!(t.display(), "the quick fox");
-        assert!(!t.undo_last());
+        assert!(t.undo_last());
+        assert_eq!(t.display(), "the quick brown fox");
     }
 
     #[test]
@@ -533,11 +564,18 @@ mod tests {
         assert_eq!(t.display(), "the cat");
         assert!(t.erase_last());
         assert_eq!(t.display(), "the");
-        // A genuinely new word arrives: both pending erasures are
-        // permanent, tracked by position (the decoder re-emits "sat").
+        // More content arrives, still the same utterance (no feed_final in
+        // between): both erasures track their positions through the
+        // growth and stay restorable - mid-utterance growth alone must
+        // never burn a pending erasure (that is what caused two rapid
+        // Left presses to scramble the sentence: see
+        // daemon::double_erase_regression).
         t.feed_partial("the cat sat down");
         assert_eq!(t.display(), "the down");
-        assert!(!t.undo_last());
+        assert!(t.undo_last());
+        assert_eq!(t.display(), "the cat down");
+        assert!(t.undo_last());
+        assert_eq!(t.display(), "the cat sat down");
     }
 
     #[test]

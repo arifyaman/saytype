@@ -1,7 +1,6 @@
 # AGENTS.md
 
 Quick orientation for coding agents (and humans) working on saytype.
-Spec lives in `gnome-dictation-mvp-guide.md`; the next iteration is planned in `mvp2-plan.md`.
 
 ## What this is
 
@@ -23,21 +22,48 @@ Pipeline per dictation session:
 - The HUD is a **GNOME Shell extension** (`extension/saytype@saytype.local/`).
   It runs inside gnome-shell (gjs), not in our process: a plain D-Bus client
   with no audio and no models. While recording it draws a dim overlay across
-  all monitors plus a pill that follows the mouse pointer (so it is visible
-  on any screen) and renders the daemon's authoritative `TranscriptUpdated`
-  verbatim; being shell-stage artwork it never steals keyboard focus and
-  behaves identically on X11 and Wayland. While recording the overlay is also
-  the mouse input surface for mid-dictation word erase/undo (LEFT press
-  erases, RIGHT press restores -> `EraseWord`/`UndoErase`); start/stop stays
-  the custom hotkey. Installed with `scripts/install-extension.sh`.
+  all monitors plus a pill that follows the mouse pointer (polled every
+  120ms, so it is visible on any screen in a multi-monitor setup - this is
+  the original MVP1 design, restored after a detour through a fixed
+  bottom-anchored redesign that turned out to fix nothing real; see the
+  file header) and renders the daemon's authoritative `TranscriptUpdated`
+  verbatim. The pill is sized explicitly, both dimensions, on every text
+  update (`_resizePill`) rather than trusting Clutter's automatic parent
+  relayout, which does not reliably happen for this actor in this build
+  (root-caused live with targeted diagnostics - see the file header):
+  it starts narrow for a short phrase (or the idle "Listening..." label)
+  and grows horizontally up to a cap - half the width of whichever
+  monitor it is currently showing on, re-evaluated live from the pointer
+  position on every update via `_currentMonitor()`, not fixed to wherever
+  it first appeared - before it starts wrapping onto more lines, so a
+  full sentence always fits, never truncated; being shell-stage artwork it never steals keyboard
+  focus and behaves identically on X11 and Wayland. While recording, the Left and
+  Right arrow keys are grabbed as global keybindings (GSettings schema
+  `org.gnome.shell.extensions.saytype`, keys `erase-word-keybinding` /
+  `undo-erase-keybinding`) for mid-dictation word erase/undo (Left erases,
+  Right restores -> `EraseWord`/`UndoErase`); the grab is added on
+  `StateChanged("Recording")` and removed on `StateChanged("Idle")`, so the
+  arrow keys behave normally (text cursor movement, etc.) the rest of the
+  time. No mouse input is used. Start/stop stays the custom hotkey.
+  Installed with `scripts/install-extension.sh` (also compiles the
+  extension's GSettings schema).
 - IPC is the session D-Bus bus:
   - Bus name `io.saytype.Dictate`, path `/io/saytype/Dictate`, interface `io.saytype.Dictate1`
   - Methods: `Toggle()`, `Stop()`, `EraseWord()`, `UndoErase()`
+  - `Toggle()` debounces: a repeat call within 350ms of the last accepted
+    one is ignored. GNOME custom shortcuts fire again on X11 key
+    auto-repeat if the hotkey is held even slightly too long - each repeat
+    spawns a new `saytype-toggle` process/D-Bus call, and without this
+    guard a burst of repeats flips Recording/Idle rapidly and can land
+    back on the wrong state (looked like "the HUD doesn't close"; also
+    corrupted the HUD's transcript, reset on every state flip). A
+    deliberate double-toggle by a human is essentially never this fast.
   - Signals: `StateChanged(String)`, `PartialTranscribed(String)`,
     `SegmentTranscribed(String)`, `TranscriptUpdated(String)`
   - `PartialTranscribed` is a live hypothesis for the utterance in progress
     (streaming backend only); `SegmentTranscribed` is the committed final.
-  - `EraseWord()`/`UndoErase()` (mid-dictation, driven by mouse buttons)
+  - `EraseWord()`/`UndoErase()` (mid-dictation, driven by the extension's
+    Left/Right arrow-key global keybindings, active only while recording)
     pop/restore the last visible word of the running session (no-op when
     idle). `TranscriptUpdated(String)` carries the full visible transcript
     (committed finals + live partial, erasures applied, casing/punctuation
@@ -54,8 +80,8 @@ Pipeline per dictation session:
 | `src/vad.rs` | Silero VAD wrapper, `detected()` in-progress probe, `VadParams` defaults, `AudioRing` context-padding buffer (batch path) + unit tests |
 | `src/asr.rs` | `Asr` tri-backend (Nemotron streaming `OnlineRecognizer` preferred, Zipformer `OnlineRecognizer` fallback, Moonshine `OfflineRecognizer` batch), `BackendSelection`/`AsrKind`, `StreamingSession` (feed/partial/commit), batch `transcribe()`, `polish()` (lowercase + strip punct + online punct) output policy, optional `OnlinePunctuation` model auto-detect |
 | `src/injector.rs` | ydotool typing (`type_text`, `backspaces`), `diff` prefix-diff, `capitalize_first` MVP punctuation stand-in + tests |
-| `src/transcript.rs` | Pure `Transcript` state machine: single source of truth for the visible text (committed finals + live partial) with mid-dictation word erase/undo. Committed text is a token-slot sequence (permanently erased words are gaps, pending erasures hide a slot) so a restored word returns to its original position; partial erasures track token positions across decoder revisions; the new-word-makes-erase-permanent rule; first visible word per segment is capitalized at render time; `display()` (HUD) + `buffer_target()` (target buffer) + unit tests |
-| `extension/saytype@saytype.local/` | GNOME Shell extension HUD (gjs, ESM-first): D-Bus proxy client, pointer-following pill + dim overlay (inline St styles, emoji mic) rendering the authoritative `TranscriptUpdated`; while recording the overlay is the input surface for LEFT=erase / RIGHT=undo (`EraseWord`/`UndoErase`); `metadata.json` |
+| `src/transcript.rs` | Pure `Transcript` state machine: single source of truth for the visible text (committed finals + live partial) with mid-dictation word erase/undo. Committed text is a token-slot sequence (permanently erased words are gaps, pending erasures hide a slot) so a restored word returns to its original position; partial erasures track token positions across decoder revisions and stay restorable for the whole utterance in progress regardless of how much the live hypothesis grows tick to tick, becoming permanent only at a genuine utterance boundary (this utterance's final showing content no partial ever did, or the next utterance's first partial); first visible word per segment is capitalized at render time; `display()` (HUD) + `buffer_target()` (target buffer) + unit tests |
+| `extension/saytype@saytype.local/` | GNOME Shell extension HUD (gjs, ESM-first): D-Bus proxy client, pointer-following word-wrapping pill + dim overlay (inline St styles, symbolic mic icon) rendering the authoritative `TranscriptUpdated` in full (no truncation); while recording, global Left/Right arrow-key keybindings (added/removed with the session) drive erase/undo (`EraseWord`/`UndoErase`); `metadata.json`, `schemas/org.gnome.shell.extensions.saytype.gschema.xml` |
 | `models/` | `silero_vad.onnx` + ASR model dirs (Nemotron streaming preferred, Zipformer + Moonshine v2 fallbacks) + optional online punct dir; gitignored; default install has only the Nemotron stack |
 | `systemd/saytype.service` | Unit template with `@REPO@`/`@BIN@` placeholders |
 | `scripts/setup-ydotool.sh` | One-time: apt ydotool, udev rule for `/dev/uinput`, `ydotoold` user service |
@@ -63,8 +89,6 @@ Pipeline per dictation session:
 | `scripts/install-user-service.sh` | Release build, install binary + `saytype-toggle` to `~/.local/bin`, install/enable service |
 | `scripts/install-extension.sh` | Copy the HUD extension into `~/.local/share/gnome-shell/extensions/` + enable it (`--uninstall` to reverse) |
 | `scripts/saytype-toggle` | `dbus-send` Toggle wrapper; bind this to a GNOME custom shortcut |
-| `gnome-dictation-mvp-guide.md` | Original MVP spec + decisions |
-| `mvp2-plan.md` | Next-iteration plan (live/real-time typing) |
 
 ## Pipeline data flow (daemon.rs)
 
@@ -89,13 +113,27 @@ is only polished when the punct model is present (denser punctuation, and
 the strip step prevents double-marking), otherwise its native output is
 kept. Moonshine (batch) output is never post-processed.
 
-**Live typing** (on by default for the streaming backend, off with
-`--no-live-typing`): the injector types a partial's prefix into the target
-app once it has survived `STABILITY_PARTIALS` (2) consecutive partials,
-corrects the tail with `backspaces` + retype as the decoder revises it, and
-each `Final` converges the buffer to the committed text (prefix-diff via
-`injector::diff`) then resets. Without live typing, only finals are typed
-(one chunk per utterance, the MVP1 behavior).
+**Typing mode** (`TypingMode`, default `Deferred`): controls *when* the
+injector types the transcript into the target app; the HUD always shows
+the live transcript immediately regardless of mode via `TranscriptUpdated`.
+
+- `Deferred` (default, no flag): nothing is typed while the session is
+  recording. The injector only tracks the `Transcript` and updates the
+  HUD; the whole accumulated transcript (with any mid-dictation erase/undo
+  already applied) is typed into the target app exactly **once**, right
+  after the session stops. This is what makes erase/undo safe to use: they
+  edit the pending HUD-only text, never a live buffer in some other app.
+- `Live` (`--live-typing`, the old mvp2 default): the injector types a
+  partial's prefix into the target app once it has survived
+  `STABILITY_PARTIALS` (2) consecutive partials, corrects the tail with
+  `backspaces` + retype as the decoder revises it, and each `Final`
+  converges the buffer to the committed text (prefix-diff via
+  `injector::diff`) then resets. Erase/undo also edit this live-typed
+  buffer immediately (backspaces into whatever real app has focus).
+- `FinalOnly` (`--no-live-typing`, the MVP1 behavior): only committed
+  finals are typed, immediately, one chunk per utterance; no partial
+  typing. Erase/undo still edit the live-typed buffer immediately, same as
+  `Live`.
 
 Batch (Moonshine):
 
@@ -220,13 +258,17 @@ gdbus monitor --session --dest io.saytype.Dictate --object-path /io/saytype/Dict
 saytype --transcribe <wav>            # batch check (auto backend)
 saytype --vad-test <wav>
 saytype --stream-test <wav>           # streaming replay: partials + finals + RTF
+saytype --paste-test "<text>"         # injector check: clipboard set + ydotool paste, timed
 ```
 
-End-to-end check: toggle, speak a sentence, verify the text lands in the
-focused app **word-by-word while speaking** (with occasional
-backspace-corrections as the decoder revises), the HUD pill shows the
-accumulating transcript (committed + live partial), and `journalctl` shows
-`VAD segment complete` + `streaming commit: ...`.
+End-to-end check: toggle, speak a sentence, verify the HUD pill shows the
+accumulating transcript **word-by-word while speaking**, wrapped in full
+(never cropped to "..."), toggle off, and confirm the whole corrected
+sentence lands in the focused app **in one paste** (not typed out
+character by character) and the HUD closes promptly. `journalctl` should
+show `VAD segment complete` + `streaming commit: ...` while recording and
+a fast `dictation session stopping` -> `stopped` gap (well under a second)
+on stop.
 
 ## Conventions
 
