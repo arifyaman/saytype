@@ -134,11 +134,9 @@ fn run_capture(stop: &Arc<AtomicBool>, frame_tx: mpsc::Sender<Vec<f32>>) -> Resu
             };
             let n = chunk_bytes.min(bytes.len());
             let samples = pcm_to_mono_f32(&format, &bytes[..n]);
-            if !samples.is_empty() {
-                if tx.blocking_send(samples).is_err() {
-                    // VAD consumer gone (session stopped); shut the loop down.
-                    ml.quit();
-                }
+            if !samples.is_empty() && tx.blocking_send(samples).is_err() {
+                // VAD consumer gone (session stopped); shut the loop down.
+                ml.quit();
             }
         })
         .register()
@@ -224,13 +222,12 @@ fn pcm_to_mono_f32(format: &AudioInfoRaw, bytes: &[u8]) -> Vec<f32> {
             let n_frames = bytes.len() / 4 / channels;
             (0..n_frames)
                 .map(|i| {
-                    let v = f32::from_le_bytes([
+                    f32::from_le_bytes([
                         bytes[i * channels * 4],
                         bytes[i * channels * 4 + 1],
                         bytes[i * channels * 4 + 2],
                         bytes[i * channels * 4 + 3],
-                    ]);
-                    v
+                    ])
                 })
                 .collect::<Vec<f32>>()
         }

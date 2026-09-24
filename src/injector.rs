@@ -19,10 +19,11 @@ pub async fn type_text(text: &str) -> io::Result<()> {
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(io::Error::new(
-            io::ErrorKind::Other,
-            format!("ydotool exited with {}: {}", output.status, stderr.trim()),
-        ));
+        return Err(io::Error::other(format!(
+            "ydotool exited with {}: {}",
+            output.status,
+            stderr.trim()
+        )));
     }
     Ok(())
 }
@@ -47,10 +48,11 @@ pub async fn backspaces(n: u32) -> io::Result<()> {
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(io::Error::new(
-            io::ErrorKind::Other,
-            format!("ydotool exited with {}: {}", output.status, stderr.trim()),
-        ));
+        return Err(io::Error::other(format!(
+            "ydotool exited with {}: {}",
+            output.status,
+            stderr.trim()
+        )));
     }
     Ok(())
 }

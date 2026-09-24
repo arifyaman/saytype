@@ -2,6 +2,7 @@ mod asr;
 mod audio;
 mod daemon;
 mod injector;
+mod transcript;
 mod vad;
 
 use std::path::PathBuf;
