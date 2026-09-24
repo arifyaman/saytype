@@ -47,12 +47,34 @@
   word, 1120 ms = best accuracy). Verified: `--stream-test` on all three
   backends, `--transcribe` on all three, seam run (final == last partial,
   no double commas), session start/stop (backend: Nemotron), 14 unit tests.
+- Mid-dictation word erase/undo (mouse buttons): **done 2026-09-24**
+  (final step for the running install: redeploy binary + extension and
+  restart the user service / shell). While a session is live, a LEFT
+  mouse press on the HUD overlay erases the last visible word from both
+  the typed buffer and the HUD; a RIGHT press restores the last erased
+  word. Both are LIFO, so multiple presses erase/undo one word at a time.
+  A newly transcribed word makes pending erasures permanent: the erased
+  word is gone for good. `src/transcript.rs` is the pure state machine:
+  committed text is a token-slot sequence (gaps for permanent erasures,
+  hidden slots for pending ones) so a restore returns a word to its
+  original position, and partial erasures track token positions across
+  decoder revisions. The injector task owns the transcript and converges
+  the typed buffer after every partial/final/erase/undo; the D-Bus
+  surface gained `EraseWord()` / `UndoErase()` (no-op when idle) and the
+  authoritative `TranscriptUpdated(String)` signal, which the HUD renders
+  verbatim (the recording overlay is the mouse input surface). Verified:
+  cargo test (43 tests: 25 transcript, 10 live-typing incl. 4
+  post-erase stability cases, 5 injector, 3 vad), clippy clean, isolated
+  D-Bus smoke test under `dbus-run-session` (the installed daemon holds
+  the real bus name), `node --check` + GNOME-46 API-surface verification
+  of the extension (no live shell available in this environment).
 - Phase 3 (next): stability N / tick tuning, stats logging (corrections
   per segment, speech-to-first-word latency), docs.
 - Outstanding: E2E with real voice (needs the user) - toggle, speak,
   watch words land live in a focused app with occasional corrections,
-  HUD tail, journal. A WAV-injection E2E was deliberately not attempted
-  (risk of disturbing the user's finicky mic/default-input setup).
+  HUD tail, journal, and LEFT/RIGHT mouse erase/undo while speaking.
+  A WAV-injection E2E was deliberately not attempted (risk of
+  disturbing the user's finicky mic/default-input setup).
 - Env notes: repo is on a FUSE mount that reports every file executable -
   commit content only, never mode changes; `git -c safe.directory=...`
   needed (dubious ownership). ydotoold runs as user service
