@@ -15,6 +15,13 @@
 //!   PipeWire thread -> frames -> VAD task (ring-padded segments) -> ASR
 //!   task -> AsrOutput channel -> injector task. No partials.
 //!
+//! The injector owns the session's `Transcript` (see `transcript.rs`), the
+//! single source of truth for what the target buffer holds and what the HUD
+//! shows. Mid-dictation word erase/undo arrives as `EraseWord()` / `UndoErase()`
+//! D-Bus calls (mouse buttons), is forwarded through the engine to the
+//! injector, and both the typed buffer and the `TranscriptUpdated` signal
+//! follow the transcript.
+//!
 //! All state/signal transitions are reported to D-Bus through `EngineEvent`s,
 //! pumped by the daemon task that owns the `SignalContext`.
 
@@ -28,6 +35,7 @@ use zbus::{interface, SignalContext};
 use crate::asr::{Asr, AsrKind, BackendSelection};
 use crate::audio::{self, CaptureHandle};
 use crate::injector;
+use crate::transcript::Transcript;
 use crate::vad::{AudioRing, Vad, VadConfig, POST_PAD_MS, PRE_PAD_MS};
 
 pub const BUS_NAME: &str = "io.saytype.Dictate";
@@ -42,6 +50,9 @@ pub enum EngineEvent {
     PartialTranscribed(String),
     /// Final text for a committed utterance.
     SegmentTranscribed(String),
+    /// The full visible transcript (committed finals plus the live partial,
+    /// mid-dictation erasures applied) that the HUD shows verbatim.
+    TranscriptUpdated(String),
 }
 
 /// Text produced by the ASR half of the pipeline, consumed by the injector.
@@ -53,11 +64,25 @@ pub enum AsrOutput {
     Final(String),
 }
 
+/// What the injector consumes: ASR outputs from the pipeline plus user
+/// commands (mouse-button erase/undo) forwarded by the engine. One channel
+/// keeps the ordering between typed text and edits strictly serialized.
+#[derive(Debug)]
+enum InjectorInput {
+    Asr(AsrOutput),
+    /// Erase the last visible word (left mouse press while recording).
+    Erase,
+    /// Restore the last erased word (right mouse press while recording).
+    Undo,
+}
+
 /// Commands sent from the D-Bus methods to the engine loop.
 #[derive(Debug, Clone, Copy)]
 pub enum EngineCmd {
     Toggle,
     Stop,
+    Erase,
+    Undo,
 }
 
 pub struct Dictate {
@@ -78,6 +103,18 @@ impl Dictate {
         let _ = self.cmd_tx.send(EngineCmd::Stop);
     }
 
+    /// Erase the last visible word of the running dictation session
+    /// (left mouse press). No-op when idle.
+    async fn erase_word(&mut self) {
+        let _ = self.cmd_tx.send(EngineCmd::Erase);
+    }
+
+    /// Restore the last erased word of the running dictation session
+    /// (right mouse press). No-op when idle or when nothing is pending.
+    async fn undo_erase(&mut self) {
+        let _ = self.cmd_tx.send(EngineCmd::Undo);
+    }
+
     #[zbus(signal)]
     async fn state_changed(ctxt: &SignalContext<'_>, state: String) -> zbus::Result<()>;
 
@@ -86,6 +123,9 @@ impl Dictate {
 
     #[zbus(signal)]
     async fn segment_transcribed(ctxt: &SignalContext<'_>, text: String) -> zbus::Result<()>;
+
+    #[zbus(signal)]
+    async fn transcript_updated(ctxt: &SignalContext<'_>, text: String) -> zbus::Result<()>;
 }
 
 impl Dictate {
@@ -106,6 +146,8 @@ async fn engine_loop(mut engine: Engine, mut cmd_rx: mpsc::UnboundedReceiver<Eng
                 }
             }
             EngineCmd::Stop => engine.stop().await,
+            EngineCmd::Erase => engine.erase_last().await,
+            EngineCmd::Undo => engine.undo_last().await,
         }
     }
 }
@@ -127,6 +169,8 @@ struct Session {
     // continuous stream); batch mode keeps the two-task VAD/ASR split.
     pipeline: PipelineTasks,
     inj_task: tokio::task::JoinHandle<()>,
+    /// Into the injector, for mid-session user commands (erase/undo).
+    inj_tx: mpsc::Sender<InjectorInput>,
 }
 
 enum PipelineTasks {
@@ -192,12 +236,32 @@ impl Engine {
         self.session.is_some()
     }
 
+    /// Erase the last visible word of the running session (left mouse
+    /// press). No-op when idle; the injector applies it and relays the
+    /// updated transcript.
+    pub async fn erase_last(&self) {
+        if let Some(session) = &self.session {
+            let _ = session.inj_tx.send(InjectorInput::Erase).await;
+        }
+    }
+
+    /// Restore the last erased word of the running session (right mouse
+    /// press). No-op when idle or when nothing is pending.
+    pub async fn undo_last(&self) {
+        if let Some(session) = &self.session {
+            let _ = session.inj_tx.send(InjectorInput::Undo).await;
+        }
+    }
+
     pub async fn start(&mut self) -> Result<()> {
         anyhow::ensure!(!self.is_recording(), "already recording");
 
         let (frames_tx, frames_rx) = mpsc::channel(128);
-        let (out_tx, out_rx) = mpsc::channel(16);
+        let (out_tx, out_rx) = mpsc::channel::<InjectorInput>(16);
         let (exited_tx, exited_rx) = oneshot::channel::<()>();
+        // A second handle for the engine, to forward user commands to the
+        // injector while the session runs.
+        let inj_tx = out_tx.clone();
 
         let capture = audio::start_capture(frames_tx, exited_tx);
 
@@ -224,16 +288,18 @@ impl Engine {
         };
 
         let events = self.events.clone();
+        let streaming = self.asr.is_streaming();
         // Live typing only makes sense with a streaming backend (they alone
         // produce partials); the batch backend always types finals only.
-        let live_typing = self.live_typing && self.asr.is_streaming();
-        let inj_task = tokio::spawn(injector_task(out_rx, events, live_typing));
+        let live_typing = self.live_typing && streaming;
+        let inj_task = tokio::spawn(injector_task(out_rx, events, live_typing, streaming));
 
         self.session = Some(Session {
             capture,
             exited_rx,
             pipeline,
             inj_task,
+            inj_tx,
         });
 
         let _ = self
@@ -316,7 +382,7 @@ async fn drain_vad(vad: &Vad, ring: &AudioRing, seg_tx: &mpsc::Sender<Vec<f32>>)
 async fn asr_task(
     asr: std::sync::Arc<Asr>,
     mut seg_rx: mpsc::Receiver<Vec<f32>>,
-    out_tx: mpsc::Sender<AsrOutput>,
+    out_tx: mpsc::Sender<InjectorInput>,
 ) {
     while let Some(samples) = seg_rx.recv().await {
         let audio_secs = samples.len() as f32 / audio::SAMPLE_RATE as f32;
@@ -333,7 +399,7 @@ async fn asr_task(
         if text.trim().is_empty() {
             continue;
         }
-        if out_tx.send(AsrOutput::Final(text)).await.is_err() {
+        if out_tx.send(InjectorInput::Asr(AsrOutput::Final(text))).await.is_err() {
             return;
         }
     }
@@ -352,7 +418,7 @@ async fn stream_task(
     vad: Vad,
     asr: std::sync::Arc<Asr>,
     mut frames_rx: mpsc::Receiver<Vec<f32>>,
-    out_tx: mpsc::Sender<AsrOutput>,
+    out_tx: mpsc::Sender<InjectorInput>,
 ) {
     let Some(session) = asr.streaming_session() else {
         tracing::error!("stream_task started without the streaming backend");
@@ -383,7 +449,7 @@ async fn stream_task(
             if seg.len() < audio::SAMPLE_RATE as usize / 10 || text.is_empty() {
                 continue;
             }
-            if out_tx.send(AsrOutput::Final(text)).await.is_err() {
+            if out_tx.send(InjectorInput::Asr(AsrOutput::Final(text))).await.is_err() {
                 return;
             }
         }
@@ -395,7 +461,11 @@ async fn stream_task(
                 let partial = session.partial();
                 if !partial.is_empty() && partial != last_partial {
                     last_partial = partial.clone();
-                    if out_tx.send(AsrOutput::Partial(partial)).await.is_err() {
+                    if out_tx
+                        .send(InjectorInput::Asr(AsrOutput::Partial(partial)))
+                        .await
+                        .is_err()
+                    {
                         return;
                     }
                 }
@@ -412,7 +482,7 @@ async fn stream_task(
             continue;
         }
         tracing::info!("flushed trailing utterance: {:?}", text);
-        if out_tx.send(AsrOutput::Final(text)).await.is_err() {
+        if out_tx.send(InjectorInput::Asr(AsrOutput::Final(text))).await.is_err() {
             return;
         }
     }
@@ -424,16 +494,17 @@ async fn stream_task(
 /// the unstable tail waits (and is corrected with backspaces if it was).
 const STABILITY_PARTIALS: usize = 2;
 
-/// Live-typing state for the current segment.
+/// Live-typing state: what has actually been put in the target buffer and
+/// the recent partial history that decides when a prefix is stable enough
+/// to type. The text itself (casing, spaces, erasures) is owned by the
+/// session's [`Transcript`]; `typed` always equals the full buffer content.
 struct LiveTyping {
-    /// Exactly what has been put in the target buffer for the current
-    /// segment (transformed: capitalized, space-prefixed after the first
-    /// segment of the session).
+    /// Exactly what has been put in the target buffer (transformed):
+    /// the committed text plus the current utterance's stable prefix.
     typed: String,
-    /// The most recent `STABILITY_PARTIALS` raw partials.
+    /// The most recent `STABILITY_PARTIALS` raw partials of the utterance
+    /// in progress.
     history: std::collections::VecDeque<String>,
-    /// True until the first segment of the session is committed.
-    first_segment: bool,
 }
 
 impl LiveTyping {
@@ -441,7 +512,6 @@ impl LiveTyping {
         Self {
             typed: String::new(),
             history: std::collections::VecDeque::new(),
-            first_segment: true,
         }
     }
 
@@ -452,10 +522,13 @@ impl LiveTyping {
         }
     }
 
-    /// The text the buffer should hold right now: the longest prefix stable
-    /// across all recent partials, transformed. None until there are enough
-    /// partials (the stability buffer).
-    fn stable_target(&self) -> Option<String> {
+    /// The full text the target buffer should hold while the utterance is
+    /// in progress: the committed text plus the longest prefix that (a) is
+    /// stable across all recent partials and (b) is still visible after
+    /// mid-dictation erasures, transformed by the transcript. `None` until
+    /// there are enough partials for a non-empty stable prefix (the caller
+    /// then skips typing rather than churn the buffer).
+    fn stable_target(&self, transcript: &Transcript) -> Option<String> {
         if self.history.len() < STABILITY_PARTIALS {
             return None;
         }
@@ -473,17 +546,22 @@ impl LiveTyping {
                 return None;
             }
         }
-        Some(self.transform(&stable))
-    }
-
-    /// The MVP typing conventions: capitalize the first letter; prefix a
-    /// space before every segment after the first of the session.
-    fn transform(&self, text: &str) -> String {
-        let mut out = injector::capitalize_first(text);
-        if !self.first_segment {
-            out.insert(0, ' ');
+        // An erase may have removed a word from the visible partial, so a
+        // raw stable prefix can reach past the visible text: truncate to a
+        // prefix of the visible partial (and drop any dangling space).
+        let visible = transcript.visible_partial();
+        let c = stable
+            .chars()
+            .zip(visible.chars())
+            .take_while(|(a, b)| a == b)
+            .count();
+        let byte_off: usize = stable.chars().take(c).map(|ch| ch.len_utf8()).sum();
+        stable.truncate(byte_off);
+        let stable = stable.trim_end();
+        if stable.is_empty() {
+            return None;
         }
-        out
+        Some(transcript.buffer_target(stable))
     }
 
     /// Bring the target buffer from `typed` to `target` with the minimal
@@ -500,51 +578,63 @@ impl LiveTyping {
         Ok(())
     }
 
-    /// A segment committed: reset for the next one.
+    /// A segment committed: the stability buffer starts fresh for the next
+    /// utterance. `typed` is kept: it now holds the whole committed text,
+    /// the baseline the next segment's prefix extends.
     fn commit_segment(&mut self) {
-        self.typed.clear();
         self.history.clear();
-        self.first_segment = false;
     }
 }
 
 /// Injector: single consumer, strictly serialized ydotool calls.
 ///
-/// With `live_typing` (streaming backend without `--no-live-typing`):
-/// partials are typed into the target app as soon as they are stable
-/// (see `STABILITY_PARTIALS`), corrected with backspaces when the decoder
-/// revises the tail; each `Final` converges the buffer to the committed
-/// text. Without it (batch backend, or `--no-live-typing`): only finals are
-/// typed - one chunk per committed utterance, the MVP1 behavior. Partials
-/// are always relayed to the HUD.
+/// Owns the session's [`Transcript`], the single source of truth for what
+/// the target buffer holds and what the HUD shows. With `live_typing`
+/// (streaming backend without `--no-live-typing`): partials are typed into
+/// the target app as soon as they are stable (see `STABILITY_PARTIALS`),
+/// corrected with backspaces when the decoder revises the tail; each
+/// `Final` converges the buffer to the committed text. Without it (batch
+/// backend, or `--no-live-typing`): only finals are typed - one chunk per
+/// committed utterance, the MVP1 behavior. Mid-dictation erase/undo
+/// commands (mouse buttons) apply to the transcript and converge the
+/// buffer. The raw ASR text is always relayed to the HUD, and the visible
+/// transcript (erasures applied) is re-sent after every change.
 async fn injector_task(
-    mut out_rx: mpsc::Receiver<AsrOutput>,
+    mut out_rx: mpsc::Receiver<InjectorInput>,
     events: mpsc::UnboundedSender<EngineEvent>,
     live_typing: bool,
+    streaming: bool,
 ) {
     let mut live = LiveTyping::new();
-    while let Some(out) = out_rx.recv().await {
-        match out {
-            AsrOutput::Partial(text) => {
+    let mut transcript = Transcript::new();
+    while let Some(input) = out_rx.recv().await {
+        match input {
+            InjectorInput::Asr(AsrOutput::Partial(text)) => {
                 let _ = events.send(EngineEvent::PartialTranscribed(text.clone()));
-                if !live_typing {
-                    continue;
-                }
-                live.push_partial(&text);
-                if let Some(target) = live.stable_target() {
-                    if let Err(e) = live.apply(&target).await {
-                        // A transient ydotool failure must not kill the
-                        // session; the final will (re)converge the buffer.
-                        tracing::error!("live typing failed: {e}");
+                transcript.feed_partial(&text);
+                if live_typing {
+                    live.push_partial(&text);
+                    if let Some(target) = live.stable_target(&transcript) {
+                        if let Err(e) = live.apply(&target).await {
+                            // A transient ydotool failure must not kill the
+                            // session; the final will (re)converge the buffer.
+                            tracing::error!("live typing failed: {e}");
+                        }
                     }
                 }
+                let _ = events.send(EngineEvent::TranscriptUpdated(transcript.display()));
             }
-            AsrOutput::Final(text) => {
+            InjectorInput::Asr(AsrOutput::Final(text)) => {
                 // Convergence: type whatever makes the buffer exactly the
-                // final text (an extension in the common case; backspaces +
-                // retype when the final differs from the last partial),
-                // then reset for the next segment.
-                let target = live.transform(&text);
+                // committed text (an extension in the common case;
+                // backspaces + retype when the final differs from the last
+                // partial), then reset for the next segment.
+                if streaming {
+                    transcript.feed_final(&text);
+                } else {
+                    transcript.feed_batch_final(&text);
+                }
+                let target = transcript.buffer_target("");
                 let ok = live.apply(&target).await.is_ok();
                 if !ok {
                     tracing::error!("ydotool failed to type final: {text:?}");
@@ -556,9 +646,40 @@ async fn injector_task(
                     format!("[type failed] {text}")
                 };
                 let _ = events.send(EngineEvent::SegmentTranscribed(event));
+                let _ = events.send(EngineEvent::TranscriptUpdated(transcript.display()));
+            }
+            InjectorInput::Erase => {
+                if transcript.erase_last() {
+                    apply_transcript_change(&mut live, &transcript, &events, "erased").await;
+                }
+            }
+            InjectorInput::Undo => {
+                if transcript.undo_last() {
+                    apply_transcript_change(&mut live, &transcript, &events, "restored").await;
+                }
             }
         }
     }
+}
+
+/// After a mid-dictation erase/undo: converge the target buffer to the
+/// transcript's current visible state (the stable prefix of the live
+/// partial when there is one, else the committed text) and relay the
+/// display to the HUD.
+async fn apply_transcript_change(
+    live: &mut LiveTyping,
+    transcript: &Transcript,
+    events: &mpsc::UnboundedSender<EngineEvent>,
+    what: &str,
+) {
+    let target = live
+        .stable_target(transcript)
+        .unwrap_or_else(|| transcript.buffer_target(""));
+    if let Err(e) = live.apply(&target).await {
+        tracing::error!("buffer convergence after {what} word failed: {e}");
+    }
+    tracing::info!("{what} word, transcript: {:?}", transcript.display());
+    let _ = events.send(EngineEvent::TranscriptUpdated(transcript.display()));
 }
 
 /// Start the daemon: load models, register the D-Bus service, pump events.
@@ -613,6 +734,11 @@ pub async fn run(
                     tracing::error!("emitting SegmentTranscribed failed: {e}");
                 }
             }
+            EngineEvent::TranscriptUpdated(text) => {
+                if let Err(e) = Dictate::transcript_updated(&signal_ctx, text).await {
+                    tracing::error!("emitting TranscriptUpdated failed: {e}");
+                }
+            }
         }
     }
     Ok(())
@@ -622,57 +748,127 @@ pub async fn run(
 mod tests {
     use super::*;
 
-    #[test]
-    fn transform_first_segment_no_space() {
-        let live = LiveTyping::new();
-        assert_eq!(live.transform("hello world"), "Hello world");
+    /// Push the same partial into both the transcript and the stability
+    /// buffer, as the injector does on each tick.
+    fn tick(live: &mut LiveTyping, t: &mut Transcript, text: &str) {
+        t.feed_partial(text);
+        live.push_partial(text);
     }
 
     #[test]
-    fn transform_later_segments_get_space_prefix() {
+    fn first_segment_target_capitalized_without_leading_space() {
         let mut live = LiveTyping::new();
-        live.commit_segment(); // now past the first segment
-        assert_eq!(live.transform("next"), " Next");
+        let mut t = Transcript::new();
+        tick(&mut live, &mut t, "hello world");
+        tick(&mut live, &mut t, "hello world");
+        assert_eq!(live.stable_target(&t), Some("Hello world".to_string()));
+    }
+
+    #[test]
+    fn later_segments_get_a_space_prefix() {
+        let mut live = LiveTyping::new();
+        let mut t = Transcript::new();
+        t.feed_final("hello world");
+        tick(&mut live, &mut t, "next");
+        tick(&mut live, &mut t, "next");
+        assert_eq!(live.stable_target(&t), Some("Hello world Next".to_string()));
     }
 
     #[test]
     fn stable_target_needs_enough_partials() {
         let mut live = LiveTyping::new();
-        live.push_partial("the");
-        assert_eq!(live.stable_target(), None);
-        live.push_partial("the");
-        assert_eq!(live.stable_target(), Some("The".to_string()));
+        let mut t = Transcript::new();
+        tick(&mut live, &mut t, "the");
+        assert_eq!(live.stable_target(&t), None);
+        tick(&mut live, &mut t, "the");
+        assert_eq!(live.stable_target(&t), Some("The".to_string()));
     }
 
     #[test]
     fn stable_target_is_common_prefix() {
         let mut live = LiveTyping::new();
-        live.push_partial("their");
-        live.push_partial("there");
+        let mut t = Transcript::new();
+        tick(&mut live, &mut t, "their");
+        tick(&mut live, &mut t, "there");
         // Common prefix "the", capitalized, no space (first segment).
-        assert_eq!(live.stable_target(), Some("The".to_string()));
+        assert_eq!(live.stable_target(&t), Some("The".to_string()));
     }
 
     #[test]
     fn stable_target_rolls_forward() {
         let mut live = LiveTyping::new();
-        live.push_partial("their");
-        live.push_partial("there");
-        assert_eq!(live.stable_target(), Some("The".to_string()));
+        let mut t = Transcript::new();
+        tick(&mut live, &mut t, "their");
+        tick(&mut live, &mut t, "there");
+        assert_eq!(live.stable_target(&t), Some("The".to_string()));
         // Next partial: "there" + "them" -> common prefix "the".
-        live.push_partial("them");
-        assert_eq!(live.stable_target(), Some("The".to_string()));
+        tick(&mut live, &mut t, "them");
+        assert_eq!(live.stable_target(&t), Some("The".to_string()));
         // "them" + "them" -> "them".
-        live.push_partial("them");
-        assert_eq!(live.stable_target(), Some("Them".to_string()));
+        tick(&mut live, &mut t, "them");
+        assert_eq!(live.stable_target(&t), Some("Them".to_string()));
     }
 
     #[test]
-    fn stable_target_empty_when_prefix_diverges_immediately() {
+    fn stable_target_none_when_prefix_diverges_immediately() {
         let mut live = LiveTyping::new();
-        live.push_partial("the");
-        live.push_partial("you");
+        let mut t = Transcript::new();
+        tick(&mut live, &mut t, "the");
+        tick(&mut live, &mut t, "you");
         // No common prefix -> nothing stable to type yet.
-        assert_eq!(live.stable_target(), None);
+        assert_eq!(live.stable_target(&t), None);
+    }
+
+    #[test]
+    fn stable_prefix_truncated_to_visible_after_erase() {
+        let mut live = LiveTyping::new();
+        let mut t = Transcript::new();
+        tick(&mut live, &mut t, "the quick brown");
+        tick(&mut live, &mut t, "the quick brown");
+        assert_eq!(live.stable_target(&t), Some("The quick brown".to_string()));
+        // Left mouse press erases the last word; the stability buffer still
+        // holds pre-erase partials, so the target must be truncated to the
+        // visible partial ("the quick").
+        assert!(t.erase_last());
+        assert_eq!(live.stable_target(&t), Some("The quick".to_string()));
+    }
+
+    #[test]
+    fn stable_prefix_never_retires_a_permanently_erased_word() {
+        let mut live = LiveTyping::new();
+        let mut t = Transcript::new();
+        tick(&mut live, &mut t, "the quick brown");
+        tick(&mut live, &mut t, "the quick brown");
+        assert!(t.erase_last()); // "brown" pending
+        // A new word arrives: "brown" is gone for good.
+        tick(&mut live, &mut t, "the quick brown fox");
+        tick(&mut live, &mut t, "the quick brown fox");
+        // The raw stable prefix "the quick brown fox" must not retype
+        // "brown"; only what is visible may be typed.
+        assert_eq!(live.stable_target(&t), Some("The quick".to_string()));
+    }
+
+    #[test]
+    fn fully_erased_partial_types_nothing() {
+        let mut live = LiveTyping::new();
+        let mut t = Transcript::new();
+        tick(&mut live, &mut t, "one");
+        tick(&mut live, &mut t, "one");
+        assert!(t.erase_last());
+        assert_eq!(live.stable_target(&t), None);
+        assert_eq!(t.buffer_target(""), "");
+    }
+
+    #[test]
+    fn final_converges_buffer_to_committed_text() {
+        let mut live = LiveTyping::new();
+        let mut t = Transcript::new();
+        tick(&mut live, &mut t, "the quick");
+        tick(&mut live, &mut t, "the quick");
+        assert_eq!(live.stable_target(&t), Some("The quick".to_string()));
+        // The final extends the committed text; the typed buffer must end
+        // up exactly at it.
+        t.feed_final("the quick brown");
+        assert_eq!(t.buffer_target(""), "The quick brown");
     }
 }
