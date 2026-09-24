@@ -3,7 +3,11 @@ use sherpa_onnx::{SileroVadModelConfig, VadModelConfig, VoiceActivityDetector};
 use std::path::Path;
 
 const SAMPLE_RATE: i32 = 16000;
-const VAD_BUFFER_SECONDS: f32 = 300.0;
+// The VAD's internal speech buffer only ever holds one in-progress segment
+// (the buffer is emptied when a segment is popped), and `max_speech_duration`
+// caps a segment at 20 s. 3x that headroom is enough; 300 s wasted ~19 MB
+// per session for nothing.
+const VAD_BUFFER_SECONDS: f32 = 60.0;
 
 /// Context padding (ms) added around each VAD segment before it reaches ASR.
 /// The VAD trims segments to the detected speech boundaries: only ~70 ms of
@@ -41,15 +45,18 @@ impl AudioRing {
         }
     }
 
-    /// Return audio over absolute sample range `[start, end)`, zero-filling any
-    /// part that precedes the start of capture (session just began).
+    /// Return audio over absolute sample range `[start, end)`. Any part that
+    /// is not available - before the start of capture, past the latest
+    /// sample, or older than the ring's retained window - is zero-filled
+    /// (never stale wrapped-around data).
     pub fn slice(&self, start: i64, end: i64) -> Vec<f32> {
         let len = (end - start).max(0) as usize;
         let mut out = vec![0.0f32; len];
         if len == 0 {
             return out;
         }
-        let lo = start.max(0);
+        // Oldest index still held in the ring; anything older is gone.
+        let lo = start.max(0).max(self.total - self.buf.len() as i64);
         let hi = end.min(self.total);
         for i in lo..hi {
             out[(i - start) as usize] = self.buf[(i as usize) % self.buf.len()];
@@ -183,6 +190,36 @@ mod tests {
         assert!(got[..50].iter().all(|&v| v == 0.0));
         assert_eq!(got[50], 0.0);
         assert_eq!(got[99], 49.0);
+    }
+
+    #[test]
+    fn slice_zero_fills_end_past_capture() {
+        let mut ring = AudioRing::new(1000);
+        let data: Vec<f32> = (0..500).map(|i| i as f32).collect();
+        ring.push(&data);
+        // Range reaches 100 samples past the latest: tail is zeros. This is
+        // the POST_PAD case at the very end of a session.
+        let got = ring.slice(450, 600);
+        assert_eq!(got.len(), 150);
+        assert_eq!(got[0], 450.0);
+        assert_eq!(got[49], 499.0);
+        assert!(got[50..].iter().all(|&v| v == 0.0));
+    }
+
+    #[test]
+    fn slice_zero_fills_out_of_window_not_stale() {
+        let mut ring = AudioRing::new(100);
+        // Push 3x capacity; indices 0..200 have scrolled out of the ring.
+        let data: Vec<f32> = (0..300).map(|i| i as f32).collect();
+        ring.push(&data);
+        // A range partly outside the retained window must zero-fill the
+        // stale part, not return wrapped-around (new) samples from the same
+        // buffer slots.
+        let got = ring.slice(150, 250);
+        assert_eq!(got.len(), 100);
+        assert!(got[..50].iter().all(|&v| v == 0.0));
+        assert_eq!(got[50], 200.0);
+        assert_eq!(got[99], 249.0);
     }
 
     #[test]

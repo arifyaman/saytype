@@ -579,11 +579,10 @@ fn find_model(dir: &Path, stem: &str) -> Option<PathBuf> {
         .ok()?
         .filter_map(|e| e.ok())
         .map(|e| e.path())
-        .filter(|p| {
+        .find(|p| {
             let name = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
             name.contains(stem) && (name.ends_with(".onnx") || name.ends_with(".ort"))
         })
-        .next()
 }
 
 /// Find a `*{stem}*.onnx` file in `dir` (zipformer layout), preferring

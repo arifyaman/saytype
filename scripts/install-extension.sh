@@ -49,6 +49,9 @@ fi
 
 mkdir -p "$EXT_DEST"
 cp -rf "$EXT_SRC"/* "$EXT_DEST"/
+if [[ -d "$EXT_DEST/schemas" ]]; then
+    glib-compile-schemas "$EXT_DEST/schemas"
+fi
 set_enabled_list add "$UUID"
 
 if gnome-extensions enable "$UUID" 2>/dev/null; then

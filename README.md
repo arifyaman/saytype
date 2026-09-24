@@ -123,5 +123,3 @@ scripts/install-extension.sh
 ```
 
 Architecture, data flow, and hard-won gotchas live in `AGENTS.md`.
-The original MVP spec is `gnome-dictation-mvp-guide.md`; the next iteration
-(live/real-time typing) is planned in `mvp2-plan.md`.

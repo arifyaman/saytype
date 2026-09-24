@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<schemalist>
+  <schema id="org.gnome.shell.extensions.saytype" path="/org/gnome/shell/extensions/saytype/">
+    <key name="erase-word-keybinding" type="as">
+      <default>["Left"]</default>
+      <summary>Erase last word while dictating</summary>
+      <description>
+        Pressed while a dictation session is recording, erases the last
+        visible transcribed/typed word (temporary until new speech makes
+        it permanent). Only active while recording; the extension adds
+        and removes this binding dynamically so the key behaves normally
+        the rest of the time.
+      </description>
+    </key>
+    <key name="undo-erase-keybinding" type="as">
+      <default>["Right"]</default>
+      <summary>Restore last erased word while dictating</summary>
+      <description>
+        Pressed while a dictation session is recording, restores the last
+        word erased with the erase-word-keybinding, if nothing has been
+        spoken since. Only active while recording.
+      </description>
+    </key>
+  </schema>
+</schemalist>

@@ -2,20 +2,34 @@
 //
 // While dictation is active it draws a dim overlay across all monitors and
 // a pill near the mouse pointer (which it tracks), so the HUD is visible on
-// any screen in a multi-monitor setup. It is a Clutter actor on the shell
-// stage, not a window, so it never steals focus and works the same on X11
-// and Wayland sessions. All state arrives over
-// the session bus:
+// any screen in a multi-monitor setup - this positioning is deliberately
+// the same design as the original MVP1 HUD (see `git show
+// main:extension/saytype@saytype.local/extension.js`), which worked fine;
+// a detour through a fixed bottom-anchored redesign turned out to fix
+// nothing the daemon wasn't already doing right and cost the pointer-
+// following UX, so it was reverted. The one real change from the original
+// is wrapping instead of truncating (see `_label` below) - the original
+// also cropped long text to "..." at this same width, it just never came
+// up until dictation got longer. It is a Clutter actor on the shell
+// stage, not a window, so it never steals keyboard focus and works the
+// same on X11 and Wayland sessions. All state arrives over the session
+// bus. The HUD consumes/calls only these members of the interface (the
+// full D-Bus API, incl. Toggle()/Stop() used by the custom hotkey, is
+// documented in AGENTS.md):
 //
 //   io.saytype.Dictate / io.saytype.Dictate1
-//     signals:  StateChanged(String), PartialTranscribed(String),
-//               SegmentTranscribed(String)
-//     methods:  Toggle(), Stop()
+//     signals:  StateChanged(String), TranscriptUpdated(String)
+//     methods:  EraseWord(), UndoErase()
 //
-// The pill shows the accumulating transcript: committed finals plus the
-// live partial tail. The daemon drains the pipeline (final
-// SegmentTranscribed) before sending StateChanged("Idle"), so the last
-// segment is always visible.
+// TranscriptUpdated carries the daemon's authoritative visible transcript
+// (committed finals plus the live partial, mid-dictation erasures applied,
+// casing/punctuation restored); the pill renders it verbatim. While
+// recording, the Left and Right arrow keys are grabbed as global
+// keybindings: Left erases the last word (EraseWord), Right restores it
+// (UndoErase). The grab is added only for the duration of the session and
+// removed the moment it stops, so the arrow keys behave normally (text
+// cursor movement, etc.) the rest of the time; no mouse input is used.
+// Dictation itself is started/stopped with a separate custom hotkey.
 //
 // ESM-first extension (GNOME 46): no `imports` module loader, no `Me`
 // global - Main comes from the shell's main.js module and the extension
@@ -29,7 +43,9 @@
 import Clutter from 'gi://Clutter';
 import GLib from 'gi://GLib';
 import Gio from 'gi://Gio';
+import Meta from 'gi://Meta';
 import Pango from 'gi://Pango';
+import Shell from 'gi://Shell';
 import St from 'gi://St';
 
 import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
@@ -42,49 +58,49 @@ const INTERFACE_NAME = 'io.saytype.Dictate1';
 const SayTypeInterface = `
 <node>
   <interface name="${INTERFACE_NAME}">
-    <method name="Toggle" />
-    <method name="Stop" />
-     <signal name="StateChanged">
+    <method name="EraseWord" />
+    <method name="UndoErase" />
+    <signal name="StateChanged">
       <arg type="s" name="state" />
-     </signal>
-     <signal name="PartialTranscribed">
+    </signal>
+    <signal name="TranscriptUpdated">
       <arg type="s" name="text" />
-     </signal>
-     <signal name="SegmentTranscribed">
-      <arg type="s" name="text" />
-     </signal>
+    </signal>
   </interface>
 </node>`;
 const SayTypeProxy = Gio.DBusProxy.makeProxyWrapper(SayTypeInterface);
 
-const MAX_TEXT_WIDTH_PX = 560;
 const CURSOR_GAP = 28; // pill offset from the pointer, below it
 const EDGE_MARGIN = 8; // keep the pill off the monitor edges
 const TRACK_INTERVAL_MS = 120; // pointer tracking cadence while recording
 const IDLE_LABEL = 'Listening\u2026';
-const MIC_TEXT = '\u{1F3A4}'; // microphones
+const MIC_ICON_NAME = 'audio-input-microphone-symbolic'; // Adwaita/system icon theme, always present
+const MIC_ICON_SIZE = 20; // px, sized up with the bigger initial pill/text
 const OVERLAY_STYLE = 'background-color: rgba(0, 0, 0, 0.35);';
+const ERASE_KEYBINDING = 'erase-word-keybinding';
+const UNDO_KEYBINDING = 'undo-erase-keybinding';
 
 const PILL_STYLE = `
   background-color: rgba(28, 28, 30, 0.94);
   border: 1px solid rgba(255, 255, 255, 0.08);
-  border-radius: 20px;
-  padding: 7px 16px;
-  spacing: 10px;
+  border-radius: 22px;
+  padding: 12px 18px;
+  spacing: 12px;
 `;
-const MIC_STYLE = 'font-size: 18px;';
+const MIC_STYLE = 'color: #f2f2f2;';
 const TEXT_STYLE = `
   color: #f2f2f2;
-  font-size: 15px;
-  max-width: ${MAX_TEXT_WIDTH_PX}px;
+  font-size: 17px;
 `;
 
-function SayTypeHUD() {
-  this._init();
+function SayTypeHUD(settings) {
+  this._init(settings);
 }
 
 SayTypeHUD.prototype = {
-  _init() {
+  _init(settings) {
+    this._settings = settings;
+    this._keybindingsActive = false;
     this._proxy = null;
     this._conns = [];
     this._nameConn = 0;
@@ -93,14 +109,15 @@ SayTypeHUD.prototype = {
     this._trackId = 0;
     this._pulseId = 0;
     this._pulseDimmed = false;
-    // Accumulating session transcript: committed finals plus the live
-    // partial tail of the current utterance.
-    this._committed = '';
-    this._partial = '';
+    // The daemon's authoritative visible transcript (committed finals
+    // plus the live partial, erasures applied, casing/punctuation
+    // restored). Rendered verbatim in the pill.
+    this._transcript = '';
     this._recording = false;
 
-    this._mic = new St.Label({
-      text: MIC_TEXT,
+    this._mic = new St.Icon({
+      icon_name: MIC_ICON_NAME,
+      icon_size: MIC_ICON_SIZE,
       style: MIC_STYLE,
       y_align: Clutter.ActorAlign.CENTER,
     });
@@ -110,26 +127,40 @@ SayTypeHUD.prototype = {
       style: TEXT_STYLE,
       y_align: Clutter.ActorAlign.CENTER,
     });
-    this._label.clutter_text.ellipsize = Pango.EllipsizeMode.END;
+    // Wrap onto multiple lines instead of truncating, and never stop
+    // rendering once one line's worth fills (both reproduced live):
+    // explicitly disable single-line mode - it is not guaranteed off by
+    // default for every St.Label in this build, and single-line-mode
+    // silently discards (not ellipsizes, not clips-with-indicator - just
+    // stops rendering) any content past the first line regardless of
+    // `line_wrap`. The actual wrap width is computed and (re)applied
+    // dynamically per update in `_resizePill`, not fixed here.
+    this._label.clutter_text.single_line_mode = false;
+    this._label.clutter_text.line_wrap = true;
+    this._label.clutter_text.line_wrap_mode = Pango.WrapMode.WORD_CHAR;
+    this._label.clutter_text.ellipsize = Pango.EllipsizeMode.NONE;
 
     this._pill = new St.BoxLayout({
       vertical: false,
       style: PILL_STYLE,
-      reactive: true,
     });
     this._pill.add_child(this._mic);
     this._pill.add_child(this._label);
     this._pill.hide();
-    this._pill.connect('button-press-event', () => {
-      this._callToggle();
-      return Clutter.EVENT_STOP;
-    });
+    // Belt-and-suspenders on top of the polling in `_startTracking`/
+    // `_queueReposition` below: also reposition the instant Clutter
+    // finishes computing this actor's real post-layout size (fires after
+    // a text change grows/shrinks the wrapped line count), so a
+    // repositioning read of `get_size()` is never racing a relayout that
+    // has not happened yet.
+    this._pill.connect('notify::allocation', () => this._reposition());
 
-    // Full-screen dim shown while recording. Non-reactive so it never
-    // blocks mouse or keyboard input; it is only a visual cue. Added to
-    // top chrome BEFORE the pill so the pill (added later) draws on top.
-    // St.Actor is not in this build's curated St typelib, so use
-    // St.Widget, as the shell itself does for its own stage actors.
+    // Full-screen dim shown while recording, purely visual (not an input
+    // surface: erase/undo is driven by the Left/Right arrow keybindings
+    // below, not mouse input). Added to top chrome BEFORE the pill so the
+    // pill (added later) draws on top. St.Actor is not in this build's
+    // curated St typelib, so use St.Widget, as the shell itself does for
+    // its own stage actors.
     this._overlay = new St.Widget({
       style: OVERLAY_STYLE,
       reactive: false,
@@ -138,6 +169,14 @@ SayTypeHUD.prototype = {
     Main.layoutManager.addTopChrome(this._overlay);
 
     Main.layoutManager.addTopChrome(this._pill);
+    // `_resizePill` queries theme-node-dependent preferred sizes
+    // (padding, etc. from CSS), which requires the actor to actually be
+    // in the stage - calling it before `addTopChrome` above caused a real
+    // crash ("st_widget_get_theme_node called on the widget which is not
+    // in the stage" -> NULL pointer -> an unhandled promise rejection
+    // that killed `_initDBus`, silently taking the whole D-Bus connection
+    // down with it - not merely a cosmetic glitch). Must run after.
+    this._resizePill();
     this._layoutOverlay();
     // Follow the panel on monitor / workarea changes. Main.panel is a JS
     // class without C-signal connectivity from here, so use the display's
@@ -165,13 +204,9 @@ SayTypeHUD.prototype = {
       (p, sender, [state]) => {
         this._setState(state === 'Recording');
       }));
-    this._conns.push(proxy.connectSignal('PartialTranscribed',
+    this._conns.push(proxy.connectSignal('TranscriptUpdated',
       (p, sender, [text]) => {
-        this._setPartial(text);
-      }));
-    this._conns.push(proxy.connectSignal('SegmentTranscribed',
-      (p, sender, [text]) => {
-        this._appendFinal(text);
+        this._setTranscript(text);
       }));
 
     // The proxy reports loss of the name owner (daemon died) so a stale
@@ -205,6 +240,7 @@ SayTypeHUD.prototype = {
       GLib.Source.remove(this._repositionId);
     this._stopPulse();
     this._stopTracking();
+    this._removeKeybindings();
     if (this._pill.get_parent())
       Main.layoutManager.removeChrome(this._pill);
     this._pill.destroy();
@@ -217,8 +253,7 @@ SayTypeHUD.prototype = {
     if (this._recording === recording)
       return;
     this._recording = recording;
-    this._committed = '';
-    this._partial = '';
+    this._transcript = '';
     this._updateLabel();
     if (recording) {
       this._layoutOverlay();
@@ -227,39 +262,98 @@ SayTypeHUD.prototype = {
       this._startPulse();
       this._startTracking();
       this._queueReposition();
+      this._addKeybindings();
     } else {
       this._overlay.hide();
       this._pill.hide();
       this._stopPulse();
       this._stopTracking();
+      this._removeKeybindings();
     }
   },
 
-  // A live partial for the utterance in progress; it replaces the current
-  // tail and is superseded by the next partial or the segment final.
-  _setPartial(text) {
+  // Grab the Left/Right arrow keys globally only while recording, so
+  // erase/undo works no matter which window has focus (or none) without
+  // permanently stealing arrow-key text navigation the rest of the time.
+  _addKeybindings() {
+    if (this._keybindingsActive)
+      return;
+    this._keybindingsActive = true;
+    Main.wm.addKeybinding(
+      ERASE_KEYBINDING,
+      this._settings,
+      Meta.KeyBindingFlags.NONE,
+      Shell.ActionMode.ALL,
+      () => this._callErase());
+    Main.wm.addKeybinding(
+      UNDO_KEYBINDING,
+      this._settings,
+      Meta.KeyBindingFlags.NONE,
+      Shell.ActionMode.ALL,
+      () => this._callUndo());
+  },
+
+  _removeKeybindings() {
+    if (!this._keybindingsActive)
+      return;
+    this._keybindingsActive = false;
+    Main.wm.removeKeybinding(ERASE_KEYBINDING);
+    Main.wm.removeKeybinding(UNDO_KEYBINDING);
+  },
+
+  // The daemon's authoritative visible transcript (committed finals plus
+  // the live partial, erasures applied, casing/punctuation restored).
+  // Replaces whatever the pill currently shows.
+  _setTranscript(text) {
     if (!this._recording)
       return;
-    this._partial = text;
+    this._transcript = text;
     this._updateLabel();
     this._queueReposition();
   },
 
-  // A committed final: append to the transcript and clear the live tail.
-  _appendFinal(text) {
-    if (!this._recording)
-      return;
-    this._committed = this._committed ? this._committed + ' ' + text : text;
-    this._partial = '';
-    this._updateLabel();
-    this._queueReposition();
-  },
-
+  // Grows the label onto more lines as text wraps (proven correct with
+  // targeted diagnostics: `label.get_size()` height reliably tracks the
+  // wrapped content, 19px/38px/57px for 1/2/3 lines). What *doesn't*
+  // reliably grow on its own: the pill (`St.BoxLayout`) that contains it -
+  // it settles to a height once and then never re-requests its natural
+  // size again for the rest of the session, no matter how tall the label
+  // gets, silently clipping/mispositioning the overflow. Rather than rely
+  // on Clutter's automatic parent relayout (empirically stuck here), the
+  // pill's height is forced explicitly from the label's own
+  // (already-correct) preferred height every update.
   _updateLabel() {
-    let shown = this._committed;
-    if (this._partial)
-      shown = shown ? shown + ' ' + this._partial : this._partial;
-    this._label.set_text(shown || IDLE_LABEL);
+    this._label.set_text(this._transcript || IDLE_LABEL);
+    this._resizePill();
+  },
+
+  // Sizes the pill to fit its content exactly, both dimensions, on every
+  // text update - not just height (see the comment on `_updateLabel`),
+  // also width: growing the pill only as wide as the current text
+  // actually needs (up to half the width of the monitor it is currently
+  // showing on - re-evaluated on every call via `_currentMonitor`, so it
+  // is never fixed to whichever screen it first appeared on) so a short
+  // phrase (or the idle "Listening..." label) gets a narrow pill, and
+  // only once real content would exceed that cap does it stop growing
+  // wider and start wrapping onto more lines instead.
+  _resizePill() {
+    const clutterText = this._label.clutter_text;
+    const maxTextWidth = Math.round(this._currentMonitor().width / 2);
+    // Natural (unwrapped, single-line) width first: temporarily clear any
+    // previously forced width so the query reflects the current text,
+    // not the last computed size.
+    clutterText.set_width(-1);
+    const [, naturalWidth] = clutterText.get_preferred_width(-1);
+    const effectiveWidth = Math.min(naturalWidth, maxTextWidth);
+    clutterText.set_width(effectiveWidth);
+    const [, labelHeight] = clutterText.get_preferred_height(effectiveWidth);
+    const [, micWidth] = this._mic.get_preferred_width(-1);
+    const [, micHeight] = this._mic.get_preferred_height(-1);
+    const horizontalPadding = 36; // PILL_STYLE: `padding: 12px 18px` (left+right)
+    const verticalPadding = 24; // PILL_STYLE: `padding: 12px 18px` (top+bottom)
+    const spacing = 12; // PILL_STYLE: `spacing: 12px` (between mic and label)
+    this._pill.set_width(effectiveWidth + micWidth + spacing + horizontalPadding);
+    this._pill.set_height(Math.max(labelHeight, micHeight) + verticalPadding);
   },
 
   _layoutOverlay() {
@@ -280,17 +374,26 @@ SayTypeHUD.prototype = {
     this._overlay.set_size(Math.round(maxX - minX), Math.round(maxY - minY));
   },
 
+  // The monitor the pointer currently sits on (falling back to primary),
+  // shared by `_reposition` (where the pill goes) and `_resizePill` (how
+  // wide it is allowed to grow before wrapping - half of that monitor's
+  // width): both need "whichever screen the pill is showing on right
+  // now", re-evaluated live, not fixed to wherever it first appeared.
+  _currentMonitor() {
+    const [px, py] = global.get_pointer();
+    const mon = Main.layoutManager.monitors.find(m =>
+      px >= m.x && px < m.x + m.width &&
+      py >= m.y && py < m.y + m.height);
+    return mon || Main.layoutManager.primaryMonitor;
+  },
+
   // Place the pill near the pointer, on the monitor that contains it, so a
   // multi-monitor user always sees it on the screen they are working on.
   _reposition() {
     if (!this._recording)
       return;
     const [px, py] = global.get_pointer();
-    let mon = Main.layoutManager.monitors.find(m =>
-      px >= m.x && px < m.x + m.width &&
-      py >= m.y && py < m.y + m.height);
-    if (!mon)
-      mon = Main.layoutManager.primaryMonitor;
+    const mon = this._currentMonitor();
     let [w, h] = this._pill.get_size();
     if (!w)
       [w, h] = [200, 40];
@@ -358,11 +461,21 @@ SayTypeHUD.prototype = {
       this._mic.opacity = 255;
   },
 
-  _callToggle() {
+  // Erase the last visible word (Left arrow key while recording).
+  _callErase() {
     if (!this._proxy)
       return;
-    this._proxy.ToggleAsync().catch(e => {
-      log(`saytype-hud: Toggle failed (daemon running?): ${e.message}`);
+    this._proxy.EraseWordAsync().catch(e => {
+      log(`saytype-hud: EraseWord failed (daemon running?): ${e.message}`);
+    });
+  },
+
+  // Restore the last erased word (Right arrow key while recording).
+  _callUndo() {
+    if (!this._proxy)
+      return;
+    this._proxy.UndoEraseAsync().catch(e => {
+      log(`saytype-hud: UndoErase failed (daemon running?): ${e.message}`);
     });
   },
 };
@@ -370,7 +483,7 @@ SayTypeHUD.prototype = {
 export default class SayTypeHudExtension extends Extension {
   enable() {
     log('saytype-hud: enabling');
-    this._saytypeHud = new SayTypeHUD();
+    this._saytypeHud = new SayTypeHUD(this.getSettings());
   }
 
   disable() {
