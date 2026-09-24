@@ -481,6 +481,22 @@ mod tests {
     }
 
     #[test]
+    fn streaming_final_with_new_word_makes_committed_erasure_permanent() {
+        let mut t = Transcript::new();
+        t.feed_final("hello world");
+        assert!(t.erase_last()); // "world" pending (committed slot)
+        // A new utterance finalizes with words no partial showed: the
+        // pending committed erasure is permanent, leaving a gap that a
+        // later segment's casing ignores.
+        t.feed_final("new text here");
+        assert_eq!(t.display(), "Hello New text here");
+        assert!(!t.undo_last());
+        // The gap stays a gap: the next segment still renders correctly.
+        t.feed_final("next");
+        assert_eq!(t.display(), "Hello New text here Next");
+    }
+
+    #[test]
     fn final_shorter_than_partial_drops_dangling_erasure() {
         let mut t = Transcript::new();
         t.feed_partial("hello world goodbye");
