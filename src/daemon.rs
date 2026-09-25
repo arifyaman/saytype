@@ -1117,7 +1117,7 @@ mod tests {
         // no `key ctrl+v` paste at stop (Live mode never pastes).
         assert_eq!(
             std::fs::read_to_string(&log).unwrap(),
-            "type Hello wo\ntype rld\nkey --repeat 2 --delay 0 --repeat-delay 0 Backspace\ntype ld.\n"
+            "type -- Hello wo\ntype -- rld\nkey --repeat 2 --delay 0 --repeat-delay 0 Backspace\ntype -- ld.\n"
         );
 
         let mut events = Vec::new();
@@ -1211,7 +1211,7 @@ mod tests {
         // `key ctrl+v` paste at stop (FinalOnly never pastes).
         assert_eq!(
             std::fs::read_to_string(&log).unwrap(),
-            "type Hello world\ntype  Next thing\nkey --repeat 6 --delay 0 --repeat-delay 0 Backspace\ntype  thing\n"
+            "type -- Hello world\ntype --  Next thing\nkey --repeat 6 --delay 0 --repeat-delay 0 Backspace\ntype --  thing\n"
         );
 
         let mut events = Vec::new();

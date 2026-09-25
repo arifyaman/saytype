@@ -29,10 +29,17 @@ async fn with_timeout<T>(
 ///
 /// Each call is a single `ydotool type` invocation. Serialization (no overlapping
 /// typing) is guaranteed by the caller feeding this through a single-consumer task.
+///
+/// The text is always passed after `--` (end-of-options): ydotool parses its
+/// CLI with boost::program_options, so a transcript chunk that starts with `-`
+/// (a hyphenated list item, "-20 degrees", ...) would otherwise be rejected
+/// as "unrecognised option" and silently lost - ydotool even exits 0 in that
+/// case, so without `--` the word simply never arrives with no error logged.
 pub async fn type_text(text: &str) -> io::Result<()> {
     with_timeout("ydotool type", async {
         let output = tokio::process::Command::new("ydotool")
             .arg("type")
+            .arg("--")
             .arg(text)
             .output()
             .await
@@ -429,6 +436,24 @@ mod tests {
         assert_eq!(x11[0].1, ["-selection", "clipboard"]);
         assert_eq!(x11[1].0, "wl-copy");
         assert!(x11[1].1.is_empty());
+    }
+
+    /// A transcript chunk that starts with `-` must reach ydotool as a
+    /// positional argument (after the `--` end-of-options marker), not be
+    /// parsed as a ydotool CLI option - otherwise the word is silently lost
+    /// (ydotool's boost::program_options rejects it as "unrecognised
+    /// option" and still exits 0).
+    #[tokio::test]
+    async fn type_text_passes_leading_dash_text_after_end_of_options() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
+        make_fake_tool(d, "ydotool", &format!("#!/bin/sh\nprintf '%s\\n' \"$@\" > {}\n", d.join("ydotool.log").display()));
+        let _env = EnvPatch::new(d, true).await;
+        type_text("- two hyphenated items").await.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(d.join("ydotool.log")).unwrap(),
+            "type\n--\n- two hyphenated items\n"
+        );
     }
 
     /// The Deferred-mode one-shot paste, end to end, on a Wayland session:
