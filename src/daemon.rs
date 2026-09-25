@@ -1141,6 +1141,87 @@ mod tests {
         );
     }
 
+    /// Resilience under a dead `ydotool` (every call exits 1): the session
+    /// must survive to the end - the HUD transcript keeps tracking every
+    /// partial/erase/final, the final that cannot converge the buffer is
+    /// marked `[type failed]` in its `SegmentTranscribed`, and the task
+    /// exits cleanly with no stop paste (Live mode never pastes). Also pins
+    /// `LiveTyping`'s failure semantics: a failed `apply` does not advance
+    /// `typed`, so every retry re-types the full target from scratch
+    /// (no incremental diff against text that was never actually typed).
+    #[tokio::test]
+    async fn live_injector_task_survives_a_failing_ydotool_and_marks_the_final() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
+        let log = d.join("ydotool.log");
+        make_fake_tool(
+            d,
+            "ydotool",
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {}\nexit 1\n",
+                log.display()
+            ),
+        );
+        let _env = EnvPatch::new(d, true).await;
+
+        let (out_tx, out_rx) = mpsc::channel::<InjectorInput>(8);
+        let (ev_tx, mut ev_rx) = mpsc::unbounded_channel::<EngineEvent>();
+        let handle = tokio::spawn(injector_task(out_rx, ev_tx, TypingMode::Live, true));
+
+        // 1: single partial - below the stability threshold, nothing typed.
+        out_tx
+            .send(InjectorInput::Asr(AsrOutput::Partial("hello wo".into())))
+            .await
+            .unwrap();
+        // 2: stable prefix "hello wo" -> first ydotool call, which fails.
+        out_tx
+            .send(InjectorInput::Asr(AsrOutput::Partial("hello world".into())))
+            .await
+            .unwrap();
+        // 3: the failure must not kill the session: the next tick retries,
+        //    re-typing the full target (the typed state never advanced).
+        out_tx
+            .send(InjectorInput::Asr(AsrOutput::Partial("hello world".into())))
+            .await
+            .unwrap();
+        // 4: erase while typing is broken: only the HUD updates.
+        out_tx.send(InjectorInput::Erase).await.unwrap();
+        // 5: the final cannot converge the buffer -> marked event.
+        out_tx
+            .send(InjectorInput::Asr(AsrOutput::Final("hello world.".into())))
+            .await
+            .unwrap();
+        drop(out_tx);
+        handle.await.unwrap();
+
+        // Exactly four failed calls: the stable prefix, the full retype on
+        // the next tick, the (failed) erase convergence, and the (failed)
+        // final convergence - all from the unchanged (empty) typed state.
+        assert_eq!(
+            std::fs::read_to_string(&log).unwrap(),
+            "type -- Hello wo\ntype -- Hello world\ntype -- Hello\ntype -- Hello\n"
+        );
+
+        let mut events = Vec::new();
+        while let Ok(ev) = ev_rx.try_recv() {
+            events.push(ev);
+        }
+        assert_eq!(
+            events,
+            vec![
+                EngineEvent::PartialTranscribed("hello wo".into()),
+                EngineEvent::TranscriptUpdated("hello wo".into()),
+                EngineEvent::PartialTranscribed("hello world".into()),
+                EngineEvent::TranscriptUpdated("hello world".into()),
+                EngineEvent::PartialTranscribed("hello world".into()),
+                EngineEvent::TranscriptUpdated("hello world".into()),
+                EngineEvent::TranscriptUpdated("hello".into()),
+                EngineEvent::SegmentTranscribed("[type failed] hello world.".into()),
+                EngineEvent::TranscriptUpdated("Hello".into()),
+            ]
+        );
+    }
+
     /// The FinalOnly-mode (MVP1 behavior) injector task, end to end, against
     /// a faked `ydotool` on a sandboxed PATH: pins the documented typing
     /// behavior - partials are *never* typed, even at the exact moment Live
