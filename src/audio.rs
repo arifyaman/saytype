@@ -239,7 +239,17 @@ fn pcm_to_mono_f32(format: &AudioInfoRaw, bytes: &[u8]) -> Vec<f32> {
     resample_linear(&data, rate as i32, SAMPLE_RATE)
 }
 
+/// Linearly resample `input` from rate `from` to rate `to`.
+///
+/// A non-positive rate is malformed (e.g. a negotiated format that parsed
+/// with the default rate 0). Without a valid source rate the samples cannot
+/// be placed on the target grid, so emit nothing; a zero source rate would
+/// otherwise divide by zero, saturate the output length to `usize::MAX`,
+/// and panic the capture thread on the "capacity overflow" allocation.
 fn resample_linear(input: &[f32], from: i32, to: i32) -> Vec<f32> {
+    if from <= 0 || to <= 0 {
+        return Vec::new();
+    }
     if from == to || input.is_empty() {
         return input.to_vec();
     }
@@ -387,6 +397,20 @@ mod tests {
     #[test]
     fn resample_empty_input() {
         assert!(resample_linear(&[], 48000, 16000).is_empty());
+    }
+
+    #[test]
+    fn resample_nonpositive_rates_return_empty() {
+        // A format that parses with the default rate 0 used to make
+        // `from as f64 / to as f64` a zero divisor: the output length
+        // saturated to usize::MAX and the collect panicked with
+        // "capacity overflow". Non-positive rates are malformed, so the
+        // frame is dropped like an unsupported format instead.
+        assert!(resample_linear(&[1.0, 2.0, 3.0], 0, 16000).is_empty());
+        assert!(resample_linear(&[1.0, 2.0, 3.0], 16000, 0).is_empty());
+        assert!(resample_linear(&[1.0, 2.0, 3.0], -1, 16000).is_empty());
+        // Both rates zero with no input: empty in, empty out.
+        assert!(resample_linear(&[], 0, 0).is_empty());
     }
 
     #[test]
