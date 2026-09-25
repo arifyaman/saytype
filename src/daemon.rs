@@ -1237,6 +1237,96 @@ mod tests {
         );
     }
 
+    /// Mid-dictation erase/undo in `Live` mode against a working `ydotool`
+    /// (the other two Live tests cover no-erase and every-call-fails):
+    /// `Erase` backspaces the erased word out of the live-typed buffer in
+    /// the focused app, `Undo` retypes the restored word immediately, and a
+    /// stable target that did not change costs no ydotool call at all.
+    #[tokio::test]
+    async fn live_injector_task_mid_dictation_erase_and_undo_edit_the_live_buffer() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
+        let log = d.join("ydotool.log");
+        make_fake_tool(
+            d,
+            "ydotool",
+            &format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> {}\n", log.display()),
+        );
+        let _env = EnvPatch::new(d, true).await;
+
+        let (out_tx, out_rx) = mpsc::channel::<InjectorInput>(8);
+        let (ev_tx, mut ev_rx) = mpsc::unbounded_channel::<EngineEvent>();
+        let handle = tokio::spawn(injector_task(out_rx, ev_tx, TypingMode::Live, true));
+
+        // 1: single partial - below the stability threshold, nothing typed.
+        out_tx
+            .send(InjectorInput::Asr(AsrOutput::Partial("hello wo".into())))
+            .await
+            .unwrap();
+        // 2: stable prefix "hello wo" across the last two partials -> type it.
+        out_tx
+            .send(InjectorInput::Asr(AsrOutput::Partial("hello world".into())))
+            .await
+            .unwrap();
+        // 3: stable prefix grows to "hello world" -> extend, no backspaces.
+        out_tx
+            .send(InjectorInput::Asr(AsrOutput::Partial("hello world".into())))
+            .await
+            .unwrap();
+        // 4: mid-dictation erase (Left arrow): "world" leaves the visible
+        //    partial; the live buffer backspaces " world" (6 chars) out.
+        out_tx.send(InjectorInput::Erase).await.unwrap();
+        // 5: undo (Right arrow): "world" is restored and retyped at once,
+        //    so the buffer again equals the visible text.
+        out_tx.send(InjectorInput::Undo).await.unwrap();
+        // 6: the same partial again: the stable target is unchanged, so no
+        //    redundant ydotool call is emitted.
+        out_tx
+            .send(InjectorInput::Asr(AsrOutput::Partial("hello world".into())))
+            .await
+            .unwrap();
+        // 7: the final converges the buffer to the committed text.
+        out_tx
+            .send(InjectorInput::Asr(AsrOutput::Final("hello world.".into())))
+            .await
+            .unwrap();
+        drop(out_tx);
+        handle.await.unwrap();
+
+        // Exactly five invocations: two prefix extensions, the erase
+        // backspace, the undo retype (leading space -> double space in the
+        // $* log), the final convergence (".") - and no `key ctrl+v` paste
+        // at stop (Live mode never pastes).
+        assert_eq!(
+            std::fs::read_to_string(&log).unwrap(),
+            "type -- Hello wo\ntype -- rld\nkey --repeat 6 --delay 0 --repeat-delay 0 Backspace\ntype --  world\ntype -- .\n"
+        );
+
+        let mut events = Vec::new();
+        while let Ok(ev) = ev_rx.try_recv() {
+            events.push(ev);
+        }
+        assert_eq!(
+            events,
+            vec![
+                EngineEvent::PartialTranscribed("hello wo".into()),
+                EngineEvent::TranscriptUpdated("hello wo".into()),
+                EngineEvent::PartialTranscribed("hello world".into()),
+                EngineEvent::TranscriptUpdated("hello world".into()),
+                EngineEvent::PartialTranscribed("hello world".into()),
+                EngineEvent::TranscriptUpdated("hello world".into()),
+                // Erase: no PartialTranscribed, HUD drops the word.
+                EngineEvent::TranscriptUpdated("hello".into()),
+                // Undo: HUD restores the word.
+                EngineEvent::TranscriptUpdated("hello world".into()),
+                EngineEvent::PartialTranscribed("hello world".into()),
+                EngineEvent::TranscriptUpdated("hello world".into()),
+                EngineEvent::SegmentTranscribed("hello world.".into()),
+                EngineEvent::TranscriptUpdated("Hello world.".into()),
+            ]
+        );
+    }
+
     /// The FinalOnly-mode (MVP1 behavior) injector task, end to end, against
     /// a faked `ydotool` on a sandboxed PATH: pins the documented typing
     /// behavior - partials are *never* typed, even at the exact moment Live
