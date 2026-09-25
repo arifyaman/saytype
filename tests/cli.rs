@@ -7,6 +7,12 @@
 //! take several seconds). With an empty models dir the two orderings are
 //! observable: if a model load ran first, the error would be a model error
 //! ("no ASR model found" / "VAD model not found") instead of the WAV error.
+//!
+//! They also pin the user-facing CLI contract: every misuse path exits 2
+//! with a diagnostic (missing argument, unknown argument, daemon positional,
+//! invalid `--asr` value), `--help`/`-h` exits 0 and lists every subcommand,
+//! and the only offline check with a subprocess-free success path
+//! (`--paste-test ""`) exits 0 without spawning any tool.
 
 use std::process::Command;
 
@@ -77,4 +83,104 @@ fn missing_wav_is_reported_cleanly() {
     );
     assert!(!ok, "a missing WAV must fail");
     assert!(stderr.contains("cannot read WAV"), "got: {stderr}");
+}
+
+/// Run the real binary with arbitrary args and return (exit code, stdout,
+/// stderr). No env mutation: every case below exits before models/, audio,
+/// or D-Bus are touched, so the tests are headless-safe and parallel-safe.
+fn run_args(args: &[&str]) -> (Option<i32>, String, String) {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_saytype"));
+    for a in args {
+        cmd.arg(a);
+    }
+    let out = cmd.output().expect("run saytype");
+    (
+        out.status.code(),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+#[test]
+fn missing_positional_arg_prints_usage_and_exits_2() {
+    for sub in [
+        "--transcribe",
+        "--vad-test",
+        "--stream-test",
+        "--paste-test",
+    ] {
+        let (code, _stdout, stderr) = run_args(&[sub]);
+        assert_eq!(code, Some(2), "{sub} without its argument must exit 2");
+        assert!(
+            stderr.contains("usage:"),
+            "{sub}: expected a usage line on stderr, got: {stderr}"
+        );
+    }
+}
+
+#[test]
+fn unknown_argument_exits_2_with_pointer_to_help() {
+    let (code, _stdout, stderr) = run_args(&["frobnicate"]);
+    assert_eq!(code, Some(2), "an unknown argument must exit 2");
+    assert!(stderr.contains("unknown argument"), "got: {stderr}");
+    assert!(stderr.contains("--help"), "got: {stderr}");
+}
+
+#[test]
+fn daemon_rejects_positional_arguments() {
+    let (code, _stdout, stderr) = run_args(&["--live-typing", "stray.wav"]);
+    assert_eq!(code, Some(2), "a daemon positional must exit 2");
+    assert!(
+        stderr.contains("daemon takes no positional arguments"),
+        "got: {stderr}"
+    );
+}
+
+#[test]
+fn invalid_asr_value_exits_2_before_any_wav_or_model_work() {
+    let (code, _stdout, stderr) =
+        run_args(&["--transcribe", "--asr", "bogus", "does-not-matter.wav"]);
+    assert_eq!(code, Some(2), "an invalid --asr value must exit 2");
+    assert!(
+        stderr.contains("--asr expects auto, streaming, zipformer, or moonshine"),
+        "got: {stderr}"
+    );
+    assert!(
+        !stderr.contains("cannot read WAV"),
+        "the value check must run before the WAV check: {stderr}"
+    );
+}
+
+#[test]
+fn paste_test_with_empty_text_exits_0_without_any_subprocess() {
+    // paste_text("") early-returns before spawning any clipboard/paste tool,
+    // so this is the one offline check whose success path needs neither a
+    // display, a model, nor ydotool - safe to assert headlessly.
+    let (code, stdout, stderr) = run_args(&["--paste-test", ""]);
+    assert_eq!(
+        code,
+        Some(0),
+        "empty paste-test text must succeed, stderr: {stderr}"
+    );
+    assert!(stdout.contains("paste_text OK"), "got: {stdout} {stderr}");
+}
+
+#[test]
+fn help_exits_0_and_lists_all_subcommands() {
+    for flag in ["--help", "-h"] {
+        let (code, stdout, _stderr) = run_args(&[flag]);
+        assert_eq!(code, Some(0), "{flag} must exit 0");
+        for sub in [
+            "--transcribe",
+            "--vad-test",
+            "--stream-test",
+            "--paste-test",
+        ] {
+            assert!(stdout.contains(sub), "{flag} output must mention {sub}");
+        }
+        assert!(
+            stdout.contains("typing mode"),
+            "help must document the typing modes, got: {stdout}"
+        );
+    }
 }
