@@ -372,7 +372,12 @@ impl Engine {
         session.capture.request_stop();
 
         // Wait for the capture thread to exit; it drops its frames sender.
-        let _ = tokio::time::timeout(Duration::from_secs(5), session.exited_rx).await;
+        // Remember whether it actually did: the join at the end of this
+        // method must not block forever on a thread that never observed
+        // the stop flag (the one unbounded stage of stop(); every other
+        // stage above is timed out).
+        let capture_exited =
+            tokio::time::timeout(Duration::from_secs(5), session.exited_rx).await.is_ok();
 
         // Audio gone: the pipeline flushes its trailing utterance and exits.
         session.pipeline.wait().await;
@@ -392,7 +397,17 @@ impl Engine {
         // deferred paste) meant the HUD stayed visibly stuck on screen for
         // the whole 30s before `StateChanged("Idle")` could be sent.
         let _ = tokio::time::timeout(Duration::from_secs(12), session.inj_task).await;
-        session.capture.join();
+        if capture_exited {
+            session.capture.join();
+        } else {
+            // The capture thread ignored the stop flag (e.g. no capture
+            // source was ever scheduled, so its callback never runs to
+            // observe it): skip the join instead of hanging the stop. The
+            // pipeline and injector have already drained, and the thread
+            // is flagged-stopped and inert for everything else; it exits
+            // on its own the next time its callback runs.
+            tracing::error!("capture thread did not exit within 5s; not joining it");
+        }
 
         let _ = self.events.send(EngineEvent::StateChanged("Idle".into()));
         tracing::info!("dictation session stopped");
@@ -1515,6 +1530,96 @@ mod tests {
         assert!(
             finals[0].to_lowercase().contains("yellow lamps"),
             "unexpected final: {finals:?}"
+        );
+    }
+
+    /// Engine state-machine lifecycle, end to end: the documented
+    /// Idle <-> Recording contract. While idle every command (stop, erase,
+    /// undo) is a silent no-op; a second start while recording is
+    /// rejected; and `stop()` drains the pipeline *before* emitting the
+    /// final `StateChanged("Idle")` (the ordering the HUD relies on), so
+    /// over the whole session the state changes are exactly Recording,
+    /// then Idle. Skipped when the models are not installed; Moonshine
+    /// keeps the load fast because the lifecycle is backend-independent.
+    /// The real PipeWire capture runs when available (a failed capture
+    /// just exits its thread early and the lifecycle still completes); the
+    /// one-shot Deferred-mode stop paste is sandboxed to faked
+    /// clipboard/ydotool tools so that even a real session - and any
+    /// ambient speech it might transcribe - can never touch the user's
+    /// clipboard or focused window.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn engine_lifecycle_idle_noops_double_start_guard_and_drain_order() {
+        let _lock = model_lock();
+        let Some(models) = repo_models_dir() else {
+            return;
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
+        // No-op stand-ins for every tool the session could invoke (the
+        // stop-time deferred paste and any Live-mode typing, if this
+        // selection ever changes).
+        make_fake_tool(d, "wl-copy", "#!/bin/sh\ncat > /dev/null\n");
+        make_fake_tool(d, "xclip", "#!/bin/sh\ncat > /dev/null\n");
+        make_fake_tool(d, "ydotool", "#!/bin/sh\nexit 0\n");
+        let _env = EnvPatch::new(d, true).await;
+
+        let (events_tx, mut events_rx) = mpsc::unbounded_channel::<EngineEvent>();
+        let mut engine =
+            match Engine::load(&models, events_tx, BackendSelection::Moonshine, TypingMode::Deferred)
+                .await
+            {
+                Ok(e) => e,
+                Err(_) => return,
+            };
+
+        // Idle: no session, and every command is a silent no-op.
+        assert!(!engine.is_recording());
+        engine.stop().await;
+        engine.erase_last().await;
+        engine.undo_last().await;
+        assert!(
+            events_rx.try_recv().is_err(),
+            "commands while idle must not emit events"
+        );
+
+        // Start: the session runs and a second start is rejected.
+        engine.start().await.expect("start with loaded models");
+        assert!(engine.is_recording());
+        let err = engine.start().await.unwrap_err().to_string();
+        assert!(
+            err.contains("already recording"),
+            "unexpected error: {err}"
+        );
+
+        // Stop: the pipeline drains before the final Idle, so over the
+        // whole session the state changes are exactly Recording, then Idle
+        // (transcript/partial/segment events may sit between them).
+        engine.stop().await;
+        assert!(!engine.is_recording());
+        let states: Vec<String> = {
+            let mut evs = Vec::new();
+            while let Ok(ev) = events_rx.try_recv() {
+                evs.push(ev)
+            }
+            evs.into_iter()
+                .filter_map(|ev| match ev {
+                    EngineEvent::StateChanged(s) => Some(s),
+                    _ => None,
+                })
+                .collect()
+        };
+        assert_eq!(
+            states,
+            vec!["Recording".to_string(), "Idle".to_string()],
+            "state changes must be exactly Recording, then Idle"
+        );
+
+        // Idle again: stop is a silent no-op.
+        engine.stop().await;
+        assert!(
+            events_rx.try_recv().is_err(),
+            "stopping while idle must not emit events"
         );
     }
 }

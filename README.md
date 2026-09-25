@@ -37,7 +37,9 @@ Each dictation session runs a pipeline inside the `saytype` daemon:
   `PartialTranscribed(String)` (live hypothesis, streaming backend only) and
   `SegmentTranscribed(String)`.
   The daemon always emits the final `SegmentTranscribed` before
-  `StateChanged("Idle")`.
+  `StateChanged("Idle")`, and every stage of the stop path is bounded, so
+  that final signal always arrives (a wedged capture thread cannot hang the
+  stop).
 
 ## Requirements
 
@@ -109,7 +111,7 @@ Canary, SenseVoice, ...) are not picked up today.
 
 ```sh
 cargo build --release        # binary at target/release/saytype
-cargo test                   # unit tests (transcript incl. empty-final edge cases, injector incl. clipboard fallback + deferred-paste pipeline + leading-dash end-of-options typing, audio format conversion, VAD AudioRing + gated real-model Silero detection, ASR model detection + polish + backend fallback + empty/short-input guard + real-model streaming round trip, daemon stable-target logic + toggle debounce + all three typing-mode injector sequences (live and final-only against a faked ydotool, incl. a dead-ydotool failure-resilience pass) + gated real-model streaming and batch pipeline tasks, config)
+cargo test                   # unit tests (transcript incl. empty-final edge cases, injector incl. clipboard fallback + deferred-paste pipeline + leading-dash end-of-options typing, audio format conversion, VAD AudioRing + gated real-model Silero detection, ASR model detection + polish + backend fallback + empty/short-input guard + real-model streaming round trip, daemon stable-target logic + toggle debounce + all three typing-mode injector sequences (live and final-only against a faked ydotool, incl. a dead-ydotool failure-resilience pass) + gated real-model streaming and batch pipeline tasks + engine lifecycle (idle no-ops, double-start guard, drain order), config)
 cargo run                    # run the daemon manually (needs models/ + session bus)
 journalctl --user -u saytype -f
 gdbus monitor --session --dest io.saytype.Dictate --object-path /io/saytype/Dictate
