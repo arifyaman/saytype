@@ -68,7 +68,13 @@ fn runtime() -> tokio::runtime::Runtime {
 
 fn run_daemon(args: &[String]) {
     let (rest, selection) = parse_asr_selection(args);
-    let typing_mode = parse_typing_mode(&rest);
+    let typing_mode = match parse_typing_mode(&rest) {
+        Some(mode) => mode,
+        None => {
+            eprintln!("--live-typing and --no-live-typing are mutually exclusive");
+            std::process::exit(2);
+        }
+    };
     let rest: Vec<String> = rest
         .into_iter()
         .filter(|a| a != "--live-typing" && a != "--no-live-typing")
@@ -95,13 +101,23 @@ fn run_daemon(args: &[String]) {
 /// nothing is typed into the target app until the session stops, so
 /// mid-dictation erase/undo never touches whatever real app has focus
 /// while you are still speaking.
-fn parse_typing_mode(args: &[String]) -> daemon::TypingMode {
-    if args.iter().any(|a| a == "--live-typing") {
-        daemon::TypingMode::Live
-    } else if args.iter().any(|a| a == "--no-live-typing") {
-        daemon::TypingMode::FinalOnly
+///
+/// Returns `None` when both `--live-typing` and `--no-live-typing` are
+/// present: they are mutually exclusive (the `--help` usage already shows
+/// them as an either/or), and picking one silently would let a typo'd
+/// command run in the wrong mode. The caller reports a usage error and
+/// exits 2, matching the rest of the CLI's strict-misuse contract.
+fn parse_typing_mode(args: &[String]) -> Option<daemon::TypingMode> {
+    let live = args.iter().any(|a| a == "--live-typing");
+    let final_only = args.iter().any(|a| a == "--no-live-typing");
+    if live && final_only {
+        None
+    } else if live {
+        Some(daemon::TypingMode::Live)
+    } else if final_only {
+        Some(daemon::TypingMode::FinalOnly)
     } else {
-        daemon::TypingMode::Deferred
+        Some(daemon::TypingMode::Deferred)
     }
 }
 
@@ -439,19 +455,37 @@ mod typing_mode_tests {
     #[test]
     fn defaults_to_deferred() {
         let args: Vec<String> = vec![];
-        assert_eq!(parse_typing_mode(&args), daemon::TypingMode::Deferred);
+        assert_eq!(parse_typing_mode(&args), Some(daemon::TypingMode::Deferred));
     }
 
     #[test]
     fn live_typing_flag_selects_live() {
         let args: Vec<String> = vec!["--live-typing".to_string()];
-        assert_eq!(parse_typing_mode(&args), daemon::TypingMode::Live);
+        assert_eq!(parse_typing_mode(&args), Some(daemon::TypingMode::Live));
     }
 
     #[test]
     fn no_live_typing_flag_selects_final_only() {
         let args: Vec<String> = vec!["--no-live-typing".to_string()];
-        assert_eq!(parse_typing_mode(&args), daemon::TypingMode::FinalOnly);
+        assert_eq!(
+            parse_typing_mode(&args),
+            Some(daemon::TypingMode::FinalOnly)
+        );
+    }
+
+    #[test]
+    fn both_typing_mode_flags_are_a_usage_error() {
+        // The two flags are mutually exclusive: passing both is a typo, not
+        // an ambiguous-but-valid command, so it must be reported (None) and
+        // never silently resolved to one of the modes.
+        let both: Vec<String> = vec!["--live-typing".to_string(), "--no-live-typing".to_string()];
+        assert_eq!(parse_typing_mode(&both), None);
+        let reversed: Vec<String> =
+            vec!["--no-live-typing".to_string(), "--live-typing".to_string()];
+        assert_eq!(parse_typing_mode(&reversed), None);
+        // A duplicated single flag is not contradictory: it still selects.
+        let dup: Vec<String> = vec!["--live-typing".to_string(), "--live-typing".to_string()];
+        assert_eq!(parse_typing_mode(&dup), Some(daemon::TypingMode::Live));
     }
 }
 

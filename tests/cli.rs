@@ -139,6 +139,22 @@ fn daemon_rejects_positional_arguments() {
 }
 
 #[test]
+fn daemon_rejects_contradictory_typing_mode_flags() {
+    // `--live-typing` and `--no-live-typing` are mutually exclusive (the
+    // `--help` usage shows them as an either/or). Passing both is a typo
+    // that used to silently run in Live mode; it must now be a usage error
+    // (exit 2) before any model/D-Bus work, so it is headless-safe.
+    let (code, _stdout, stderr) = run_args(&["--live-typing", "--no-live-typing"]);
+    assert_eq!(code, Some(2), "contradictory typing-mode flags must exit 2");
+    assert!(stderr.contains("mutually exclusive"), "got: {stderr}");
+    // The diagnostic runs before the daemon loads: no models/D-Bus error.
+    assert!(
+        !stderr.contains("daemon failed"),
+        "the flag check must run before the daemon starts: {stderr}"
+    );
+}
+
+#[test]
 fn invalid_asr_value_exits_2_before_any_wav_or_model_work() {
     let (code, _stdout, stderr) =
         run_args(&["--transcribe", "--asr", "bogus", "does-not-matter.wav"]);
