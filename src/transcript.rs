@@ -540,6 +540,27 @@ mod tests {
     }
 
     #[test]
+    fn undo_of_a_decoder_dropped_partial_word_is_visible_noop() {
+        let mut t = Transcript::new();
+        t.feed_partial("a b");
+        assert!(t.erase_last()); // "b" (position 1) pending
+        assert_eq!(t.display(), "a");
+        // Contrast with final_shorter_than_partial_drops_dangling_erasure, where
+        // the *final* dropped "b" and the erasure vanished (undo returns false).
+        // Here the *live partial* revised "b" away mid-utterance: an utterance
+        // is still in progress, so the erasure is still pending.
+        t.feed_partial("a");
+        assert_eq!(t.display(), "a");
+        // undo_last consumes the entry (returns true) but there is nothing to
+        // put back - "b" is no longer in the partial - so the visible text is
+        // unchanged.
+        assert!(t.undo_last());
+        assert_eq!(t.display(), "a");
+        // Nothing left to undo.
+        assert!(!t.undo_last());
+    }
+
+    #[test]
     fn empty_final_drops_partial_erasures_but_keeps_committed() {
         let mut t = Transcript::new();
         t.feed_final("hello world");
