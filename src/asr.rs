@@ -537,12 +537,15 @@ impl<'a> StreamingSession<'a> {
     }
 }
 
-/// Normalize raw streaming ASR output for typing/display: lowercase it,
-/// drop any existing punctuation (the punct model is trained on
-/// unpunctuated text; feeding it pre-punctuated text double-marks it), and
-///, when the online punctuation model is available, let it restore casing +
-/// punctuation. Without the model, the text is just lowercased/stripped
-/// (more readable than all-caps).
+/// Normalize raw streaming ASR output for typing/display. Lowercases the text
+/// and strips the sentence punctuation marks (comma, period, question mark,
+/// exclamation mark, semicolon, colon) that the online-punct model would
+/// regenerate, so feeding it pre-punctuated text cannot double-mark. When the
+/// online punctuation model is available it restores casing + punctuation;
+/// without it the text is just lowercased/stripped (more readable than
+/// all-caps). Intra-word punctuation (hyphens, apostrophes) is kept, since it
+/// is not the sentence punctuation the model regenerates, so contractions and
+/// hyphenated words survive intact.
 fn polish(punct: Option<&OnlinePunctuation>, raw: &str) -> String {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -710,6 +713,26 @@ mod tests {
         assert_eq!(polish(None, "?!...;:"), "");
         // Inner whitespace runs are preserved as-is (single spaces here).
         assert_eq!(polish(None, "a, b"), "a b");
+    }
+
+    /// The strip step removes only the sentence punctuation the online-punct
+    /// model would regenerate (.,!?;:), so feeding pre-punctuated text cannot
+    /// double-mark it. Intra-word punctuation is intentionally preserved: the
+    /// Nemotron backend is natively cased + punctuated, so contractions
+    /// ("don't") and hyphenated words ("well-known") must reach the model and
+    /// the typed text intact, not be shredded by an over-eager strip. (A
+    /// hyphen/apostrophe is not sentence punctuation, so the model would
+    /// neither add nor expect to re-mark it.)
+    #[test]
+    fn polish_keeps_intra_word_punctuation_strips_only_sentence_marks() {
+        // Contractions keep their apostrophe; hyphenated words keep their hyphens.
+        assert_eq!(polish(None, "DON'T STOP"), "don't stop");
+        assert_eq!(polish(None, "well-known words"), "well-known words");
+        // Sentence marks are still stripped (alongside lowercasing) while the
+        // hyphen and apostrophe survive.
+        assert_eq!(polish(None, "Well-known, don't? Stop!"), "well-known don't stop");
+        // All-caps hyphenated phrase with a trailing mark.
+        assert_eq!(polish(None, "STATE-OF-THE-ART?"), "state-of-the-art");
     }
 
     #[test]
