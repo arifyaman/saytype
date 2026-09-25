@@ -264,7 +264,9 @@ impl Asr {
         None
     }
 
-    fn resolve_zipformer_paths(models_dir: &Path) -> Result<ZipformerPaths> {
+    pub(crate) fn resolve_zipformer_paths(
+        models_dir: &Path,
+    ) -> Result<ZipformerPaths> {
         // Model artifacts get reorganized between releases, so instead of
         // hardcoding exact filenames we scan for a directory that contains an
         // encoder/decoder/joiner ONNX triple plus tokens.txt.
@@ -360,7 +362,7 @@ impl Asr {
     /// Find the Nemotron streaming (English) model dir: a
     /// `sherpa-onnx-nemotron-speech-streaming-en-*` dir with
     /// encoder/decoder/joiner ONNX files + `tokens.txt`.
-    fn find_nemotron(models_dir: &Path) -> Option<NemotronPaths> {
+    pub(crate) fn find_nemotron(models_dir: &Path) -> Option<NemotronPaths> {
         let mut dirs: Vec<PathBuf> = std::fs::read_dir(models_dir)
             .ok()?
             .filter_map(|e| e.ok())
@@ -551,8 +553,12 @@ struct MoonshinePaths {
     tokens: String,
 }
 
-struct ZipformerPaths {
-    dir: PathBuf,
+/// `pub(crate)` only so the real-model tests outside this module (daemon)
+/// can reuse the canonical dir detection instead of re-implementing the
+/// naming rules.
+#[derive(Debug)]
+pub(crate) struct ZipformerPaths {
+    pub(crate) dir: PathBuf,
     encoder: String,
     decoder: String,
     joiner: String,
@@ -565,8 +571,12 @@ struct PunctPaths {
     vocab: String,
 }
 
-struct NemotronPaths {
-    dir: PathBuf,
+/// `pub(crate)` only so the real-model tests outside this module (daemon)
+/// can reuse the canonical dir detection instead of re-implementing the
+/// naming rules.
+#[derive(Debug)]
+pub(crate) struct NemotronPaths {
+    pub(crate) dir: PathBuf,
     encoder: String,
     decoder: String,
     joiner: String,
@@ -844,7 +854,7 @@ mod tests {
     fn resolve_zipformer_paths_ok_and_error() {
         let models = models_dir();
         // No matching dir at all: Err with a helpful message.
-        let err = Asr::resolve_zipformer_paths(models.path()).err().expect("error expected").to_string();
+        let err = Asr::resolve_zipformer_paths(models.path()).expect_err("error expected").to_string();
         assert!(err.contains("no ASR model found"), "unexpected error: {err}");
 
         // Complete dir resolves with the epoch-tagged files.

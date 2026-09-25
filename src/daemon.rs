@@ -839,7 +839,7 @@ pub async fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testutil::{make_fake_tool, EnvPatch};
+    use crate::testutil::{make_fake_tool, model_lock, repo_models_dir, EnvPatch};
 
     /// Push the same partial into both the transcript and the stability
     /// buffer, as the injector does on each tick.
@@ -1238,6 +1238,117 @@ mod tests {
                 EngineEvent::TranscriptUpdated("Hello world Next".into()),
                 EngineEvent::TranscriptUpdated("Hello world Next thing".into()),
             ]
+        );
+    }
+
+    /// The streaming pipeline task, end to end, on the real model + real
+    /// speech (silently skipped when the repo's `models/` dir has no
+    /// streaming backend or its test WAV): feed a 16 kHz utterance in
+    /// 512-sample frames slightly slower than real time, so the 150 ms
+    /// wall-clock partial tick actually fires while the VAD detects speech
+    /// (a burst feed would finish before the first tick), and pin the
+    /// documented contract: live `Partial`s are emitted while the utterance
+    /// is in progress, all of them before a single `Final` that the VAD
+    /// commits at the utterance's trailing silence.
+    // The model-serialization lock is a bare unit flag whose whole purpose
+    // is to span the test's model load *and* decode phase, so holding it
+    // across the awaits is intentional (the sync real-model tests in asr/
+    // vad hold it the same way; a tokio mutex would not work there).
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn stream_task_emits_live_partials_then_one_final_for_real_utterance() {
+        let _lock = model_lock();
+        let Some(models) = repo_models_dir() else {
+            return;
+        };
+        let asr = match Asr::new(&models, 2, BackendSelection::Streaming) {
+            Ok(a) => a,
+            Err(_) => return,
+        };
+        // Use the test WAV shipped with whichever streaming model dir is
+        // installed (both carry the same "After early nightfall..." file).
+        let wav = if let Some(p) = Asr::find_nemotron(&models) {
+            p.dir.join("test_wavs/0.wav")
+        } else if let Ok(p) = Asr::resolve_zipformer_paths(&models) {
+            p.dir.join("test_wavs/0.wav")
+        } else {
+            return;
+        };
+        if !wav.is_file() {
+            return;
+        }
+        let vad = match Vad::new(&VadConfig::from_models_dir(&models)) {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+        let wave =
+            sherpa_onnx::Wave::read(wav.to_str().expect("utf-8 path")).expect("read test wav");
+        assert_eq!(wave.sample_rate(), 16000, "fixture must be 16 kHz");
+        let frames: Vec<Vec<f32>> = wave.samples().chunks(512).map(|c| c.to_vec()).collect();
+
+        let (frames_tx, frames_rx) = mpsc::channel::<Vec<f32>>(128);
+        let (out_tx, mut out_rx) = mpsc::channel::<InjectorInput>(16);
+        let handle = tokio::spawn(stream_task(
+            vad,
+            std::sync::Arc::new(asr),
+            frames_rx,
+            out_tx,
+        ));
+
+        // Pace the first frames (20 ms per 32 ms frame, ~1.6x real time)
+        // until the first live partial arrives, then burst the rest: the
+        // trailing silence inside the WAV is what finalizes the utterance.
+        let mut fed = 0;
+        for frame in &frames {
+            frames_tx.send(frame.clone()).await.unwrap();
+            fed += 1;
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            if matches!(
+                out_rx.try_recv(),
+                Ok(InjectorInput::Asr(AsrOutput::Partial(_)))
+            ) {
+                break;
+            }
+        }
+        for frame in &frames[fed..] {
+            frames_tx.send(frame.clone()).await.unwrap();
+        }
+        // Audio source ended: the task flushes (nothing left, the trailing
+        // silence already finalized the utterance) and exits.
+        drop(frames_tx);
+        handle.await.unwrap();
+
+        let mut outputs = Vec::new();
+        while let Ok(input) = out_rx.try_recv() {
+            outputs.push(input);
+        }
+        let final_idx = outputs
+            .iter()
+            .position(|o| matches!(o, InjectorInput::Asr(AsrOutput::Final(_))));
+        let mut partials = 0;
+        let mut finals = Vec::new();
+        for (idx, input) in outputs.iter().enumerate() {
+            match input {
+                InjectorInput::Asr(AsrOutput::Partial(_)) => {
+                    partials += 1;
+                    assert!(
+                        final_idx.is_none_or(|f| idx < f),
+                        "a partial arrived after the final"
+                    );
+                }
+                InjectorInput::Asr(AsrOutput::Final(f)) => finals.push(f.clone()),
+                other => panic!("unexpected input: {other:?}"),
+            }
+        }
+        assert!(
+            partials >= 1,
+            "no live partials were emitted ({:?} outputs)",
+            outputs.len()
+        );
+        assert_eq!(finals.len(), 1, "exactly one final expected: {finals:?}");
+        assert!(
+            finals[0].to_lowercase().contains("yellow lamps"),
+            "unexpected final: {finals:?}"
         );
     }
 }
