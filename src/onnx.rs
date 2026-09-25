@@ -251,6 +251,25 @@ mod tests {
     }
 
     #[test]
+    fn fixed_width_fields_accepted_and_truncation_rejected() {
+        // The two remaining wire types the envelope walker accepts are the
+        // fixed-width ones: wire type 1 (fixed 64-bit, skip 8 bytes) and wire
+        // type 5 (fixed 32-bit, skip 4 bytes). A full field of the right
+        // width walks cleanly; a file ending inside the fixed payload is the
+        // interrupted-download truncation case (Ok(false), not an I/O error).
+        // Field 2, wire type 1 -> tag 0x11, then exactly 8 payload bytes.
+        let fixed64 = [0x08, 0x03, 0x11, 0u8, 0, 0, 0, 0, 0, 0, 0];
+        assert!(is_plausible_onnx(&fixed64[..]).unwrap());
+        // Same tag but only 3 of the 8 payload bytes present: truncated.
+        assert!(!is_plausible_onnx(&fixed64[..6][..]).unwrap());
+        // Field 2, wire type 5 -> tag 0x15, then exactly 4 payload bytes.
+        let fixed32 = [0x08, 0x03, 0x15, 0u8, 0, 0, 0];
+        assert!(is_plausible_onnx(&fixed32[..]).unwrap());
+        // Same tag but only 2 of the 4 payload bytes present: truncated.
+        assert!(!is_plausible_onnx(&fixed32[..5][..]).unwrap());
+    }
+
+    #[test]
     fn multi_byte_varint_tag_and_value_accepted() {
         // A top-level field number >= 16 encodes its tag as a multi-byte
         // varint (field 16, wire type 0 -> tag bytes 0x80 0x01); real
