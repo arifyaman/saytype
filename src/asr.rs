@@ -880,6 +880,52 @@ mod tests {
     }
 
     #[test]
+    fn partial_model_dirs_fall_through_the_selection_chain() {
+        let models = models_dir();
+        // Realistic half-downloads: a Nemotron dir missing its joiner and a
+        // Zipformer dir whose encoder lacks the "epoch" tag. Neither is a
+        // candidate, so no backend may be *selected* (and then fail to
+        // load) - the chain must fall through to the detection errors.
+        let broken_n = sub(models.path(), "sherpa-onnx-nemotron-speech-streaming-en-0.6b");
+        file(&broken_n, "encoder.int8.onnx");
+        file(&broken_n, "decoder.int8.onnx");
+        file(&broken_n, "tokens.txt");
+
+        let broken_z = sub(models.path(), "sherpa-onnx-streaming-zipformer-bilingual-zh-en");
+        file(&broken_z, "encoder.onnx"); // no "epoch" in the name
+        file(&broken_z, "decoder-epoch-99.onnx");
+        file(&broken_z, "joiner-epoch-99.onnx");
+        file(&broken_z, "tokens.txt");
+
+        // Auto walks nemotron -> zipformer -> moonshine; the outermost error
+        // is the moonshine one, proving the chain fell through completely.
+        let err = Asr::new(models.path(), 1, BackendSelection::Auto)
+            .err()
+            .expect("error expected")
+            .to_string();
+        assert!(err.contains("no Moonshine model found"), "unexpected error: {err}");
+
+        // Streaming stops after the zipformer stage (no moonshine fallback).
+        let err = Asr::new(models.path(), 1, BackendSelection::Streaming)
+            .err()
+            .expect("error expected")
+            .to_string();
+        assert!(err.contains("no ASR model found"), "unexpected error: {err}");
+
+        // Forced backends report their own detection failure, not a load error.
+        let err = Asr::new(models.path(), 1, BackendSelection::Zipformer)
+            .err()
+            .expect("error expected")
+            .to_string();
+        assert!(err.contains("no ASR model found"), "unexpected error: {err}");
+        let err = Asr::new(models.path(), 1, BackendSelection::Moonshine)
+            .err()
+            .expect("error expected")
+            .to_string();
+        assert!(err.contains("no Moonshine model found"), "unexpected error: {err}");
+    }
+
+    #[test]
     fn check_models_dir_reports_missing_dir() {
         let models = models_dir();
         let missing = models.path().join("no-such-dir");
