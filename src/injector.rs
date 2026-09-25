@@ -278,4 +278,54 @@ mod tests {
         // Replace the multibyte é with e: one backspace, type "e".
         assert_eq!(diff("café", "cafe"), (1, "e"));
     }
+
+    #[test]
+    fn diff_empty_both_sides() {
+        assert_eq!(diff("", ""), (0, ""));
+    }
+
+    #[test]
+    fn diff_multibyte_boundaries() {
+        // `new` is a char-prefix of `typed` ending just before a multibyte
+        // char: the backspace count is in chars, and the retype offset must
+        // land on a char boundary in `new` (it does: it is a sum of char
+        // widths, never a byte mid-sequence).
+        assert_eq!(diff("café", "caf"), (1, ""));
+        // Diverge at a multibyte char: rewind to the common prefix, retype
+        // the (ASCII) replacement and everything after it.
+        assert_eq!(diff("naïve", "naive"), (3, "ive"));
+        // Pure extension past a multibyte common prefix.
+        assert_eq!(diff("café", "café au lait"), (0, " au lait"));
+        // Full replacement of a single multibyte char.
+        assert_eq!(diff("é", "e"), (1, "e"));
+    }
+
+    #[test]
+    fn capitalize_first_multichar_uppercase() {
+        // ß uppercases to two chars (SS), not one: the extend-based build
+        // must absorb the whole grapheme without truncating the rest.
+        assert_eq!(capitalize_first("ßtraße"), "SStraße");
+    }
+
+    #[test]
+    fn capitalize_first_leading_non_letters() {
+        // Whitespace-only and leading punctuation: "capitalize" is a no-op
+        // on them, and nothing is dropped or reordered.
+        assert_eq!(capitalize_first("   "), "   ");
+        assert_eq!(capitalize_first(", hello"), ", hello");
+    }
+
+    #[tokio::test]
+    async fn empty_paste_is_a_noop() {
+        // A deferred session in which the user erased everything ends with
+        // an empty transcript: the one-shot stop paste must succeed without
+        // touching the clipboard or the focused app (no subprocess spawned).
+        assert!(paste_text("").await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn zero_backspaces_is_a_noop() {
+        // Zero backspaces must not spawn ydotool at all.
+        assert!(backspaces(0).await.is_ok());
+    }
 }
