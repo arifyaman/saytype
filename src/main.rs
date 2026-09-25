@@ -542,4 +542,32 @@ mod asr_selection_tests {
         assert_eq!(selection, asr::BackendSelection::Auto);
         assert!(rest.is_empty());
     }
+
+    #[test]
+    fn parse_asr_selection_repeated_flags_are_last_wins() {
+        // A repeated `--asr` flag is accepted, and the last occurrence's value
+        // decides (not the first, not "any valid one") - both orders pinned so
+        // a future refactor cannot silently flip the precedence.
+        let args: Vec<String> = vec![
+            "--asr".into(),
+            "auto".into(),
+            "--asr".into(),
+            "moonshine".into(),
+            "file.wav".into(),
+        ];
+        let (rest, selection) = parse_asr_selection(&args);
+        assert_eq!(selection, asr::BackendSelection::Moonshine);
+        assert_eq!(rest, vec!["file.wav".to_string()]);
+
+        let args: Vec<String> = vec![
+            "--asr".into(),
+            "moonshine".into(),
+            "--asr".into(),
+            "auto".into(),
+            "file.wav".into(),
+        ];
+        let (rest, selection) = parse_asr_selection(&args);
+        assert_eq!(selection, asr::BackendSelection::Auto);
+        assert_eq!(rest, vec!["file.wav".to_string()]);
+    }
 }

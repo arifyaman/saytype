@@ -10,9 +10,11 @@
 //!
 //! They also pin the user-facing CLI contract: every misuse path exits 2
 //! with a diagnostic (missing argument, unknown argument, daemon positional,
-//! invalid `--asr` value), `--help`/`-h` exits 0 and lists every subcommand,
-//! and the only offline check with a subprocess-free success path
-//! (`--paste-test ""`) exits 0 without spawning any tool.
+//! invalid `--asr` value), repeated `--asr` flags are last-wins rather than a
+//! usage error (an invalid value on any occurrence still exits 2),
+//! `--help`/`-h` exits 0 and lists every subcommand, and the only offline
+//! check with a subprocess-free success path (`--paste-test ""`) exits 0
+//! without spawning any tool.
 
 use std::process::Command;
 
@@ -175,6 +177,49 @@ fn asr_flag_missing_or_empty_value_exits_2() {
             "the --asr check must run before the WAV check: {stderr}"
         );
     }
+}
+
+#[test]
+fn repeated_asr_flags_are_last_wins_not_a_usage_error() {
+    // Repeated `--asr` flags are accepted (the last valid value wins; which
+    // value wins is pinned by the unit test in src/main.rs), so the command
+    // proceeds past flag parsing to the WAV check. An invalid value on any
+    // occurrence still exits 2, even when an earlier occurrence was valid.
+    let (code, _stdout, stderr) = run_args(&[
+        "--transcribe",
+        "--asr",
+        "auto",
+        "--asr",
+        "moonshine",
+        "does-not-exist.wav",
+    ]);
+    assert_eq!(
+        code,
+        Some(1),
+        "repeated valid --asr flags must not be a usage error: {stderr}"
+    );
+    assert!(
+        stderr.contains("cannot read WAV"),
+        "the command must proceed to the WAV check, got: {stderr}"
+    );
+
+    let (code, _stdout, stderr) = run_args(&[
+        "--transcribe",
+        "--asr",
+        "moonshine",
+        "--asr",
+        "bogus",
+        "does-not-exist.wav",
+    ]);
+    assert_eq!(
+        code,
+        Some(2),
+        "an invalid later --asr value must still exit 2: {stderr}"
+    );
+    assert!(
+        stderr.contains("--asr expects auto, streaming, zipformer, or moonshine"),
+        "got: {stderr}"
+    );
 }
 
 #[test]
