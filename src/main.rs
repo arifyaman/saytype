@@ -88,6 +88,20 @@ fn parse_typing_mode(args: &[String]) -> daemon::TypingMode {
     }
 }
 
+/// Map a `--asr` value to its `BackendSelection`, or `None` for anything
+/// not a recognized backend name. Kept pure (no exit) so the value-mapping
+/// contract is unit-testable; the invalid-value error handling (message +
+/// exit) lives in `parse_asr_selection`, its only caller.
+fn parse_asr_value(value: &str) -> Option<asr::BackendSelection> {
+    match value {
+        "streaming" => Some(asr::BackendSelection::Streaming),
+        "zipformer" => Some(asr::BackendSelection::Zipformer),
+        "moonshine" => Some(asr::BackendSelection::Moonshine),
+        "auto" => Some(asr::BackendSelection::Auto),
+        _ => None,
+    }
+}
+
 /// Parse `--asr <auto|streaming|zipformer|moonshine>` out of a subcommand's
 /// args, returning the remaining positional args and the selection.
 fn parse_asr_selection(args: &[String]) -> (Vec<String>, asr::BackendSelection) {
@@ -97,12 +111,9 @@ fn parse_asr_selection(args: &[String]) -> (Vec<String>, asr::BackendSelection) 
     while i < args.len() {
         if args[i] == "--asr" {
             i += 1;
-            selection = match args.get(i).map(String::as_str) {
-                Some("streaming") => asr::BackendSelection::Streaming,
-                Some("zipformer") => asr::BackendSelection::Zipformer,
-                Some("moonshine") => asr::BackendSelection::Moonshine,
-                Some("auto") => asr::BackendSelection::Auto,
-                _ => {
+            selection = match args.get(i).map(String::as_str).and_then(parse_asr_value) {
+                Some(sel) => sel,
+                None => {
                     eprintln!("--asr expects auto, streaming, zipformer, or moonshine");
                     std::process::exit(2);
                 }
@@ -411,5 +422,52 @@ mod typing_mode_tests {
     fn no_live_typing_flag_selects_final_only() {
         let args: Vec<String> = vec!["--no-live-typing".to_string()];
         assert_eq!(parse_typing_mode(&args), daemon::TypingMode::FinalOnly);
+    }
+}
+
+#[cfg(test)]
+mod asr_selection_tests {
+    use super::*;
+
+    #[test]
+    fn parse_asr_value_maps_all_valid_backends() {
+        assert_eq!(
+            parse_asr_value("streaming"),
+            Some(asr::BackendSelection::Streaming)
+        );
+        assert_eq!(
+            parse_asr_value("zipformer"),
+            Some(asr::BackendSelection::Zipformer)
+        );
+        assert_eq!(
+            parse_asr_value("moonshine"),
+            Some(asr::BackendSelection::Moonshine)
+        );
+        assert_eq!(
+            parse_asr_value("auto"),
+            Some(asr::BackendSelection::Auto)
+        );
+    }
+
+    #[test]
+    fn parse_asr_value_rejects_unknown_and_malformed_values() {
+        for bad in ["", "STREAMING", "auto ", " streaming", "nemotron", "vad", "auto/streaming"] {
+            assert_eq!(parse_asr_value(bad), None, "expected {bad:?} to be rejected");
+        }
+    }
+
+    #[test]
+    fn parse_asr_selection_extracts_selection_and_keeps_positionals() {
+        let args: Vec<String> = vec!["--asr".into(), "streaming".into(), "file.wav".into()];
+        let (rest, selection) = parse_asr_selection(&args);
+        assert_eq!(selection, asr::BackendSelection::Streaming);
+        assert_eq!(rest, vec!["file.wav".to_string()]);
+    }
+
+    #[test]
+    fn parse_asr_selection_defaults_to_auto_when_flag_absent() {
+        let (rest, selection) = parse_asr_selection(&[]);
+        assert_eq!(selection, asr::BackendSelection::Auto);
+        assert!(rest.is_empty());
     }
 }
