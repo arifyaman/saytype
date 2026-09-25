@@ -818,6 +818,55 @@ mod tests {
     }
 
     #[test]
+    fn failed_erase_pushes_no_undo_entry() {
+        let mut t = Transcript::new();
+        t.feed_partial("a b");
+        assert!(t.erase_last()); // "b" (position 1)
+        assert!(t.erase_last()); // "a" (position 0)
+        assert_eq!(t.display(), "");
+        // Nothing left to erase: the partial is fully hidden and there is no
+        // committed text. A no-op that must not push an undo entry.
+        assert!(!t.erase_last());
+        // The two real erasures are still restorable, LIFO: "a" was erased
+        // last, so it comes back first.
+        assert!(t.undo_last());
+        assert_eq!(t.display(), "a");
+        assert!(t.undo_last());
+        assert_eq!(t.display(), "a b");
+        assert!(!t.undo_last());
+    }
+
+    #[test]
+    fn committed_erasure_made_within_an_utterance_survives_a_shortening_final() {
+        let mut t = Transcript::new();
+        t.feed_final("hello world");
+        // Utterance in progress; erase the partial down to nothing, then
+        // keep erasing into the committed text of the previous segment. The
+        // undo stack now holds three Partial entries and one Committed entry.
+        t.feed_partial("a b c");
+        assert!(t.erase_last()); // "c" (partial position 2)
+        assert!(t.erase_last()); // "b" (partial position 1)
+        assert!(t.erase_last()); // "a" (partial position 0)
+        assert!(t.erase_last()); // "world" (committed)
+        assert_eq!(t.display(), "Hello");
+        // The final is a shortening revision (two words, fewer than the
+        // three the partial showed): no new content, so no flush. The
+        // committed erasure stays restorable; the partial erasures at
+        // positions the final still contains convert to committed slots.
+        t.feed_final("a b");
+        assert_eq!(t.display(), "Hello");
+        // "world" was erased last, so it restores first; then the partial
+        // words in reverse erase order.
+        assert!(t.undo_last());
+        assert_eq!(t.display(), "Hello world");
+        assert!(t.undo_last());
+        assert_eq!(t.display(), "Hello world A");
+        assert!(t.undo_last());
+        assert_eq!(t.display(), "Hello world A b");
+        assert!(!t.undo_last());
+    }
+
+    #[test]
     fn erasing_and_restoring_a_segments_first_word_keeps_casing() {
         let mut t = Transcript::new();
         t.feed_final("hello world");
