@@ -168,7 +168,9 @@ pub fn check_model_file(path: &Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::AudioRing;
+    use super::{AudioRing, Vad, VadConfig, VadParams, check_model_file};
+    use crate::testutil::{model_lock, repo_models_dir};
+    use std::path::Path;
 
     #[test]
     fn slice_returns_pushed_range() {
@@ -327,5 +329,182 @@ mod tests {
         assert_eq!(got[0], 0.0); // index 0 fell out of the 1-sample window
         assert_eq!(got[1], 0.0); // index 1 fell out too
         assert_eq!(got[2], 3.0); // the newest sample is retained
+    }
+
+    #[test]
+    fn check_model_file_reports_missing_with_download_hint() {
+        let missing = Path::new("/nonexistent/silero_vad.onnx");
+        let err = check_model_file(missing).unwrap_err().to_string();
+        assert!(err.contains("silero_vad.onnx"), "unexpected error: {err}");
+        assert!(
+            err.contains("download-models.sh"),
+            "error should point at the fix: {err}"
+        );
+    }
+
+    #[test]
+    fn check_model_file_accepts_existing_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = dir.path().join("silero_vad.onnx");
+        std::fs::write(&p, b"").expect("write placeholder");
+        assert!(check_model_file(&p).is_ok());
+    }
+
+    #[test]
+    fn vad_new_with_missing_model_errors_cleanly() {
+        // A bad model path must surface as an Err (the daemon reports it at
+        // startup), never a panic or a half-initialized detector.
+        // (`.err()` rather than `.unwrap_err()`: the Ok type `Vad` wraps an
+        // FFI object and does not implement Debug.)
+        let err = Vad::new(&VadConfig {
+            model_path: "/nonexistent/silero_vad.onnx".to_string(),
+            params: VadParams::default(),
+        })
+        .err()
+        .expect("error expected")
+        .to_string();
+        assert!(err.contains("failed to create VAD"), "unexpected error: {err}");
+    }
+
+    /// The 16 kHz mono test WAV shipped inside the model dirs, if any model
+    /// dir with 16 kHz test audio is installed. Not every model ships 16 kHz
+    /// test audio (the Moonshine dir's 0.wav is 24 kHz - the VAD is 16 kHz
+    /// only, and feeding it a different rate garbles the signal), so the
+    /// canonical WAV header's sample rate is checked.
+    fn test_wav(models: &Path) -> Option<std::path::PathBuf> {
+        let entries = std::fs::read_dir(models).ok()?;
+        for entry in entries.flatten() {
+            let wav = entry.path().join("test_wavs/0.wav");
+            if wav.is_file() && is_16k_wav(&wav) {
+                return Some(wav);
+            }
+        }
+        None
+    }
+
+    /// True when a canonical (44-byte header) WAV file samples at 16 kHz.
+    fn is_16k_wav(path: &Path) -> bool {
+        use std::io::Read;
+        let mut f = match std::fs::File::open(path) {
+            Ok(f) => f,
+            Err(_) => return false,
+        };
+        let mut buf = [0u8; 44];
+        if f.read_exact(&mut buf).is_err() {
+            return false;
+        }
+        // "fmt " chunk in the canonical position; sample rate at offset 24.
+        if &buf[8..12] != b"fmt " {
+            return false;
+        }
+        let rate = u32::from_le_bytes(buf[24..28].try_into().expect("4 bytes"));
+        rate == 16000
+    }
+
+    /// Build a real-model Vad from the repo's models dir; returns None
+    /// (test skips) when the model file is not installed.
+    fn real_vad() -> Option<Vad> {
+        let models = repo_models_dir()?;
+        let model = models.join("silero_vad.onnx");
+        if !model.is_file() {
+            return None;
+        }
+        Some(
+            Vad::new(&VadConfig {
+                model_path: model.to_string_lossy().into_owned(),
+                params: VadParams::default(),
+            })
+            .expect("VAD loads from the repo model"),
+        )
+    }
+
+    /// Pure digital silence must never register as speech - neither the
+    /// in-progress probe nor a finalized segment (skipped when the model
+    /// file is absent).
+    #[test]
+    fn vad_silence_never_reports_speech() {
+        let _lock = model_lock();
+        let Some(vad) = real_vad() else { return };
+        // ~2 s of silence in 512-sample (32 ms) windows.
+        let silence = vec![0.0f32; 16000];
+        for chunk in silence.chunks(512) {
+            vad.feed(chunk);
+            assert!(!vad.detected(), "silence reported as in-progress speech");
+        }
+        assert!(vad.take_segment().is_none(), "silence finalized a segment");
+    }
+
+    /// Real speech must flip the in-progress probe, and the finalized
+    /// segment must carry the absolute input-sample start the daemon uses
+    /// to slice context padding from the AudioRing (skipped when the
+    /// model file or test WAV is absent).
+    #[test]
+    fn vad_detects_speech_and_reports_absolute_start() {
+        let _lock = model_lock();
+        let Some(models) = repo_models_dir() else { return };
+        let Some(wav_path) = test_wav(&models) else { return };
+        let Some(vad) = real_vad() else { return };
+        let wave = sherpa_onnx::Wave::read(wav_path.to_str().expect("utf-8"))
+            .expect("read test wav");
+        let samples = wave.samples().to_vec();
+        assert!(samples.len() > 16000, "test wav should be at least 1 s");
+
+        // A 512-sample silence prefix makes the segment start a
+        // non-trivial absolute index.
+        vad.feed(&vec![0.0f32; 512]);
+        let mut saw_detection = false;
+        for chunk in samples.chunks(512) {
+            vad.feed(chunk);
+            if vad.detected() {
+                saw_detection = true;
+            }
+        }
+        assert!(saw_detection, "no in-progress detection while feeding speech");
+
+        // The default min_silence_duration is 0.8 s; 1.0 s finalizes it.
+        vad.feed(&vec![0.0f32; 16000]);
+        let mut total = 0usize;
+        let mut starts = Vec::new();
+        while let Some((seg, start)) = vad.take_segment() {
+            starts.push(start);
+            total += seg.len();
+        }
+        assert!(!starts.is_empty(), "no finalized segment after trailing silence");
+        assert!(
+            total > 16000,
+            "finalized audio shorter than 1 s: {total} samples"
+        );
+        // Every segment must begin inside the WAV (after the prefix) and
+        // none may reach into the trailing silence.
+        let last = 512 + samples.len() as i64;
+        for start in &starts {
+            assert!(*start >= 512, "start {start} is before the silence prefix");
+            assert!(*start < last, "start {start} is past the speech");
+        }
+    }
+
+    /// The daemon calls `flush()` when the audio source ends (dictation
+    /// stop); the trailing utterance must become available even with no
+    /// trailing silence, because that is exactly the state at a hotkey
+    /// toggle (skipped when the model file or test WAV is absent).
+    #[test]
+    fn vad_flush_finalizes_trailing_utterance() {
+        let _lock = model_lock();
+        let Some(models) = repo_models_dir() else { return };
+        let Some(wav_path) = test_wav(&models) else { return };
+        let Some(vad) = real_vad() else { return };
+        let wave = sherpa_onnx::Wave::read(wav_path.to_str().expect("utf-8"))
+            .expect("read test wav");
+        let samples = wave.samples().to_vec();
+        vad.feed(&samples);
+        vad.flush();
+        let mut total = 0usize;
+        while let Some((seg, _)) = vad.take_segment() {
+            total += seg.len();
+        }
+        assert!(
+            total > 16000,
+            "flushed audio shorter than 1 s: {total} samples"
+        );
     }
 }

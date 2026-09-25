@@ -1,7 +1,8 @@
-//! Shared helpers for the unit tests that drive real (faked) subprocesses.
+//! Shared helpers for the unit tests that drive real (faked) subprocesses
+//! or real models.
 //!
-//! Lives in its own `cfg(test)` module so `injector.rs` and `daemon.rs`
-//! share the same locks: every fake tool is a `#!/bin/sh` script (concurrent
+//! Lives in its own `cfg(test)` module so `injector.rs`, `daemon.rs`, `asr.rs`
+//! and `vad.rs` share the same locks: every fake tool is a `#!/bin/sh` script (concurrent
 //! execs of the same shared interpreter can race in the kernel's exec
 //! write-count bookkeeping - observed ETXTBSY from `spawn` under the full
 //! parallel suite - so no two tool-spawning tests may overlap their spawns,
@@ -21,6 +22,27 @@ pub static TOOL_SPAWN_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_n
 /// `TOOL_SPAWN_LOCK` (in that fixed order) keeps an env-mutating test from
 /// racing every other tool-spawning test as well.
 pub static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Serializes the real-model tests across modules (asr, vad): a Nemotron
+/// encoder alone is ~623 MB and each loaded model keeps its ONNX
+/// allocations alive for the whole test, so loading several of them in
+/// parallel (the harness runs up to one test per CPU) is wasteful and,
+/// on a loaded box, slow.
+pub static MODEL_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Lock the real-model serialization mutex. Recovers from poisoning so
+/// one test panicking cannot strand the others.
+pub fn model_lock() -> std::sync::MutexGuard<'static, ()> {
+    MODEL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// The repo's `models/` directory, or None when it is absent (e.g. a
+/// fresh clone before `scripts/download-models.sh`) - the real-model
+/// tests skip silently in that case.
+pub fn repo_models_dir() -> Option<std::path::PathBuf> {
+    let p = Path::new(env!("CARGO_MANIFEST_DIR")).join("models");
+    p.is_dir().then_some(p)
+}
 
 /// Write an executable fake tool to `dir` and return its absolute path
 /// (commands are looked up by exact path, so no PATH or env mutation is

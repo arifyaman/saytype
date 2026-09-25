@@ -646,6 +646,7 @@ pub fn check_models_dir(models_dir: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testutil::{model_lock, repo_models_dir};
     use std::fs;
 
     /// Create an empty `models/`-like directory (removed on drop).
@@ -670,14 +671,6 @@ mod tests {
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default()
-    }
-
-    /// The repo's `models/` directory, or None when it is absent (e.g. a
-    /// fresh clone before `scripts/download-models.sh`) - the real-model
-    /// tests skip silently in that case.
-    fn repo_models_dir() -> Option<PathBuf> {
-        let p = Path::new(env!("CARGO_MANIFEST_DIR")).join("models");
-        p.is_dir().then_some(p)
     }
 
     #[test]
@@ -931,18 +924,6 @@ mod tests {
             .expect("error expected")
             .to_string();
         assert!(err.contains("no Moonshine model found"), "unexpected error: {err}");
-    }
-
-    /// Serializes the real-model tests: a Nemotron encoder alone is
-    /// ~623 MB and each loaded model keeps its ONNX allocations alive for
-    /// the whole test, so loading several of them in parallel (the harness
-    /// runs up to one test per CPU) is wasteful and, on a loaded box, slow.
-    static MODEL_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    /// Lock the real-model serialization mutex. Recovers from poisoning so
-    /// one test panicking cannot strand the others.
-    fn model_lock() -> std::sync::MutexGuard<'static, ()> {
-        MODEL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// `polish` with a real online-punctuation model (skipped when the
