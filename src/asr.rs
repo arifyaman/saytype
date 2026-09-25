@@ -1106,6 +1106,36 @@ mod tests {
         );
     }
 
+    /// A VAD segment of pure noise (a cough, a click) can make the ASR
+    /// backend emit a fragment that is *entirely* sentence punctuation -
+    /// which the strip step collapses to an empty string. The remaining
+    /// `polish` path then hands that empty text to the online-punct model
+    /// (`add_punctuation("")`); the regression this test exists for is that
+    /// the model must not invent text (a stray period, a phantom word) out
+    /// of an empty input, which would type nothing-but-junk into the target
+    /// app. Skipped when the repo's `models/` dir or the punct model is
+    /// absent.
+    #[test]
+    fn polish_of_punct_only_input_never_invents_text() {
+        let _lock = model_lock();
+        let Some(models) = repo_models_dir() else {
+            return;
+        };
+        let Some(p) = Asr::create_punct(&models, 1) else {
+            return;
+        };
+        // Trim is non-empty but every char is a stripped sentence mark, so
+        // the text handed to the model is empty; the result must be empty.
+        assert_eq!(polish(Some(&p), "?!...;:"), "");
+        assert_eq!(polish(Some(&p), "??"), "");
+        // The trim-only short-circuit (no model call) also stays empty.
+        assert_eq!(polish(Some(&p), ""), "");
+        assert_eq!(polish(Some(&p), "   \t  "), "");
+        // A model that *does* add marks still returns them for real text,
+        // so the empty result above is not a blanket no-op of the model.
+        assert!(!polish(Some(&p), "hello world").is_empty());
+    }
+
     /// Full `StreamingSession` round trip on a real model + real speech
     /// (skipped when the repo's `models/` dir is absent): feed a 16 kHz
     /// utterance in 512-sample chunks like the live pipeline, watch live
