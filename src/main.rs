@@ -142,7 +142,10 @@ fn parse_asr_selection(args: &[String]) -> (Vec<String>, asr::BackendSelection) 
     (rest, selection)
 }
 
-/// Offline ASR check: `saytype --transcribe [--asr <sel>] <file.wav>` (16 kHz mono).
+/// Offline ASR check: `saytype --transcribe [--asr <sel>] <file.wav>` (16 kHz
+/// mono). The WAV is read and validated (exists, 16 kHz) before the model
+/// loads, so a bad input fails in milliseconds instead of after a multi-second
+/// model load.
 fn run_transcribe(args: &[String]) {
     let (rest, selection) = parse_asr_selection(args);
     if rest.is_empty() {
@@ -155,7 +158,8 @@ fn run_transcribe(args: &[String]) {
     let res = rt.block_on(async move {
         init_logging();
         let out = tokio::task::spawn_blocking(move || {
-            let asr = asr::Asr::new(&models, 4, selection)?;
+            // Fail fast on unreadable/wrong-rate input, before spending
+            // seconds loading the model for a WAV that would be rejected.
             let wave = sherpa_onnx::Wave::read(&path)
                 .with_context(|| format!("cannot read WAV {path:?}"))?;
             anyhow::ensure!(
@@ -164,6 +168,7 @@ fn run_transcribe(args: &[String]) {
                 wave.sample_rate()
             );
             let samples = wave.samples().to_vec();
+            let asr = asr::Asr::new(&models, 4, selection)?;
             let (text, elapsed) = asr.transcribe(&samples);
             Ok::<_, anyhow::Error>((text, elapsed, samples.len()))
         })
@@ -181,7 +186,8 @@ fn run_transcribe(args: &[String]) {
     }
 }
 
-/// Offline VAD check: `saytype --vad-test <file.wav>` (16 kHz mono).
+/// Offline VAD check: `saytype --vad-test <file.wav>` (16 kHz mono). The WAV
+/// is read and validated (exists, 16 kHz) before the VAD model loads.
 fn run_vad_test(args: &[String]) {
     if args.is_empty() {
         eprintln!("usage: saytype --vad-test <file.wav>");
@@ -194,8 +200,8 @@ fn run_vad_test(args: &[String]) {
         init_logging();
         let cfg = vad::VadConfig::from_models_dir(&models);
         let (n_seg, total, n) = tokio::task::spawn_blocking(move || {
-            vad::check_model_file(std::path::Path::new(&cfg.model_path))?;
-            let vad = vad::Vad::new(&cfg)?;
+            // Fail fast on unreadable/wrong-rate input, before loading the
+            // VAD model for a WAV that would be rejected.
             let wave = sherpa_onnx::Wave::read(&path)
                 .with_context(|| format!("cannot read WAV {path:?}"))?;
             anyhow::ensure!(
@@ -203,6 +209,8 @@ fn run_vad_test(args: &[String]) {
                 "expected a 16 kHz WAV, got {} Hz",
                 wave.sample_rate()
             );
+            vad::check_model_file(std::path::Path::new(&cfg.model_path))?;
+            let vad = vad::Vad::new(&cfg)?;
             let samples = wave.samples();
             let mut n_seg = 0usize;
             let mut total = 0usize;
@@ -300,7 +308,8 @@ fn run_paste_test(args: &[String]) {
 /// live pipeline uses - a VAD for commit boundaries and one continuous
 /// streaming session - printing each changed partial and each committed
 /// final, plus decode-cost stats. This is the regression harness for the
-/// streaming path (what `--transcribe` is for the batch path).
+/// streaming path (what `--transcribe` is for the batch path). The WAV is
+/// read and validated (exists, 16 kHz) before the models load.
 fn run_stream_test(args: &[String]) {
     let (rest, selection) = parse_asr_selection(args);
     if rest.is_empty() {
@@ -313,10 +322,8 @@ fn run_stream_test(args: &[String]) {
     let res = rt.block_on(async move {
         init_logging();
         tokio::task::spawn_blocking(move || {
-            let model = asr::Asr::new(&models, 4, selection)?;
-            let Some(session) = model.streaming_session() else {
-                anyhow::bail!("streaming backend required (pass --asr streaming)");
-            };
+            // Fail fast on unreadable/wrong-rate input, before spending
+            // seconds loading the models for a WAV that would be rejected.
             let wave = sherpa_onnx::Wave::read(&path)
                 .with_context(|| format!("cannot read WAV {path:?}"))?;
             anyhow::ensure!(
@@ -327,6 +334,10 @@ fn run_stream_test(args: &[String]) {
             let samples = wave.samples().to_vec();
             let rate = 16000usize;
 
+            let model = asr::Asr::new(&models, 4, selection)?;
+            let Some(session) = model.streaming_session() else {
+                anyhow::bail!("streaming backend required (pass --asr streaming)");
+            };
             let vad = vad::Vad::new(&vad::VadConfig::from_models_dir(&models))?;
 
             let mut last_partial = String::new();
