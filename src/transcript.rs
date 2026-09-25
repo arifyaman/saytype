@@ -765,6 +765,37 @@ mod tests {
     }
 
     #[test]
+    fn mixed_partial_and_committed_erasures_undo_lifo_across_the_final() {
+        let mut t = Transcript::new();
+        t.feed_final("hello world");
+        t.feed_partial("a b");
+        // Erase both partial words, then erase into the committed text: the
+        // undo stack now holds, oldest to newest, two Partial entries
+        // followed by one Committed entry.
+        assert!(t.erase_last()); // "b" (partial position 1)
+        assert!(t.erase_last()); // "a" (partial position 0)
+        assert!(t.erase_last()); // "world" (committed)
+        assert_eq!(t.display(), "Hello");
+        // The final commits the same two words: no new content, so both
+        // partial erasures convert to restorable committed-slot erasures
+        // and the committed erasure passes through - one mixed stack.
+        t.feed_final("a b");
+        assert_eq!(t.display(), "Hello");
+        // Undo is LIFO across the conversion boundary: "world" was erased
+        // last, so it comes back first, then the partial words in reverse
+        // erase order ("a" was erased after "b").
+        assert!(t.undo_last());
+        assert_eq!(t.display(), "Hello world");
+        assert!(t.undo_last());
+        assert_eq!(t.display(), "Hello world A");
+        assert!(t.undo_last());
+        assert_eq!(t.display(), "Hello world A b");
+        assert!(!t.undo_last());
+        // The typed buffer follows the same order.
+        assert_eq!(t.buffer_target(""), "Hello world A b");
+    }
+
+    #[test]
     fn fully_erased_segment_leaves_a_gap_that_undoes_cleanly() {
         let mut t = Transcript::new();
         t.feed_final("one two");
