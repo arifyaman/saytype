@@ -42,7 +42,7 @@ pub const BUS_NAME: &str = "io.saytype.Dictate";
 pub const OBJECT_PATH: &str = "/io/saytype/Dictate";
 pub const INTERFACE_NAME: &str = "io.saytype.Dictate1";
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EngineEvent {
     StateChanged(String),
     /// Live partial hypothesis for the utterance in progress (streaming
@@ -998,6 +998,60 @@ mod tests {
         // (a wrong offset would panic on the truncate), and the result is
         // capitalized as the first segment's text.
         assert_eq!(live.stable_target(&t), Some("Caf".to_string()));
+    }
+
+    /// The default (Deferred) injector task, end to end: partials, a final,
+    /// and mid-dictation erasures drive exactly the D-Bus event sequence the
+    /// daemon emits. Because the user erases every word before stopping, the
+    /// one-shot stop paste is a no-op (no subprocess), so this runs in any
+    /// environment, including headless CI.
+    #[tokio::test]
+    async fn deferred_injector_task_emits_the_documented_event_sequence() {
+        let (out_tx, out_rx) = mpsc::channel::<InjectorInput>(8);
+        let (ev_tx, mut ev_rx) = mpsc::unbounded_channel::<EngineEvent>();
+        let handle = tokio::spawn(injector_task(
+            out_rx,
+            ev_tx,
+            TypingMode::Deferred,
+            true,
+        ));
+
+        out_tx
+            .send(InjectorInput::Asr(AsrOutput::Partial("hello world".into())))
+            .await
+            .unwrap();
+        out_tx
+            .send(InjectorInput::Asr(AsrOutput::Partial("hello world".into())))
+            .await
+            .unwrap();
+        out_tx
+            .send(InjectorInput::Asr(AsrOutput::Final("hello world".into())))
+            .await
+            .unwrap();
+        out_tx.send(InjectorInput::Erase).await.unwrap();
+        out_tx.send(InjectorInput::Erase).await.unwrap();
+        // Close the input: the session is stopping, so the (now empty)
+        // transcript is pasted once - a no-op here.
+        drop(out_tx);
+        handle.await.unwrap();
+
+        let mut events = Vec::new();
+        while let Ok(ev) = ev_rx.try_recv() {
+            events.push(ev);
+        }
+        assert_eq!(
+            events,
+            vec![
+                EngineEvent::PartialTranscribed("hello world".into()),
+                EngineEvent::TranscriptUpdated("hello world".into()),
+                EngineEvent::PartialTranscribed("hello world".into()),
+                EngineEvent::TranscriptUpdated("hello world".into()),
+                EngineEvent::SegmentTranscribed("hello world".into()),
+                EngineEvent::TranscriptUpdated("Hello world".into()),
+                EngineEvent::TranscriptUpdated("Hello".into()),
+                EngineEvent::TranscriptUpdated(String::new()),
+            ]
+        );
     }
 }
 
