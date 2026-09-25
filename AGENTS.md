@@ -75,7 +75,7 @@ Pipeline per dictation session:
 | File | What to find there |
 |---|---|
 | `src/main.rs` | CLI dispatch (daemon / `--transcribe <wav>` / `--vad-test <wav>` / `--stream-test <wav>`, all take `--asr`), models-dir resolution, logging |
-| `src/daemon.rs` | D-Bus service (`Toggle`/`Stop`/`EraseWord`/`UndoErase` + signals), `Engine` state machine (Idle/Recording), per-session pipeline: `stream_task` (streaming) or `vad_task`+`asr_task` (batch), `injector_task` (owns the session's `Transcript`, applies erase/undo, emits `TranscriptUpdated`); `EngineEvent`/`AsrOutput`/`InjectorInput` |
+| `src/daemon.rs` | D-Bus service (`Toggle`/`Stop`/`EraseWord`/`UndoErase` + signals), `Engine` state machine (Idle/Recording), per-session pipeline: `stream_task` (streaming) or `vad_task`+`asr_task` (batch), `injector_task` (owns the session's `Transcript`, applies erase/undo, emits `TranscriptUpdated`); `EngineEvent`/`AsrOutput`/`InjectorInput`; unit tests for `LiveTyping` stable-target logic (incl. multibyte prefix boundaries) and the `Dictate::toggle` auto-repeat debounce |
 | `src/audio.rs` | PipeWire capture on a dedicated OS thread; S16LE 16 kHz mono in, f32 frames out via mpsc; pure conversion helpers `pcm_to_mono_f32` / `resample_linear` + unit tests |
 | `src/vad.rs` | Silero VAD wrapper, `detected()` in-progress probe, `VadParams` defaults, `AudioRing` context-padding buffer (batch path) + unit tests (incl. boundary/degenerate `slice` ranges; `AudioRing::new` clamps capacity to >= 1 so a zero-capacity ring can't panic on the modulo) |
 | `src/asr.rs` | `Asr` tri-backend (Nemotron streaming `OnlineRecognizer` preferred, Zipformer `OnlineRecognizer` fallback, Moonshine `OfflineRecognizer` batch), `BackendSelection`/`AsrKind`, `StreamingSession` (feed/partial/commit), batch `transcribe()`, `polish()` (lowercase + strip punct + online punct) output policy, optional `OnlinePunctuation` model auto-detect, + unit tests for the model-dir detection helpers (`find_moonshine`/`find_nemotron`/`resolve_zipformer_paths`/`find_online_punct` + filename matching/preference rules) and `polish()` |
@@ -239,7 +239,7 @@ pipeline (final `SegmentTranscribed`) **before** emitting
 
 ```sh
 cargo build --release        # release binary at target/release/saytype
-cargo test                   # unit tests (transcript, injector, audio format conversion, VAD AudioRing, ASR model detection + polish, daemon stable-target logic, config)
+cargo test                   # unit tests (transcript, injector, audio format conversion, VAD AudioRing, ASR model detection + polish, daemon stable-target logic + toggle debounce, config)
 cargo run                    # run the daemon manually (needs models/ + session bus)
 
 scripts/install-user-service.sh   # build + install + enable the user service

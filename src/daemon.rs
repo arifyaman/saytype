@@ -963,6 +963,42 @@ mod tests {
         t.feed_final("the quick brown");
         assert_eq!(t.buffer_target(""), "The quick brown");
     }
+
+    /// The documented X11 hotkey auto-repeat guard: a burst of Toggle() calls
+    /// (one per physical key repeat) must produce exactly one engine command,
+    /// and repeats must not extend the window past the last *accepted* toggle.
+    #[tokio::test]
+    async fn toggle_debounces_auto_repeat_bursts() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<EngineCmd>();
+        let mut d = Dictate::new(tx);
+        // First press: accepted.
+        d.toggle().await;
+        // Key auto-repeat: the same physical press re-fires the shortcut
+        // well inside the debounce window - both must be dropped.
+        d.toggle().await;
+        d.toggle().await;
+        assert!(matches!(rx.try_recv(), Ok(EngineCmd::Toggle)));
+        assert!(rx.try_recv().is_err());
+        // Past the window (anchored to the accepted toggle, not the dropped
+        // repeats) a deliberate toggle is accepted again.
+        tokio::time::sleep(TOGGLE_DEBOUNCE + Duration::from_millis(10)).await;
+        d.toggle().await;
+        assert!(matches!(rx.try_recv(), Ok(EngineCmd::Toggle)));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn stable_target_multibyte_prefix_lands_on_char_boundary() {
+        let mut live = LiveTyping::new();
+        let mut t = Transcript::new();
+        tick(&mut live, &mut t, "café");
+        tick(&mut live, &mut t, "caffè");
+        // The common prefix "caf" ends just before the two-byte \u{e}: the
+        // char count must be converted to a byte offset on a char boundary
+        // (a wrong offset would panic on the truncate), and the result is
+        // capitalized as the first segment's text.
+        assert_eq!(live.stable_target(&t), Some("Caf".to_string()));
+    }
 }
 
 #[cfg(test)]
