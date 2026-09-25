@@ -1250,6 +1250,64 @@ mod tests {
         }
     }
 
+    /// `--transcribe` on real speech through the `OnlineRecognizer` batch
+    /// path (Nemotron preferred, Zipformer fallback): the whole utterance is
+    /// fed at once via `accept_waveform`, `input_finished()`, a decode loop,
+    /// then `get_result()`. This is distinct from the `StreamingSession`
+    /// feed/partial/commit path (which uses one stream across many chunks)
+    /// and from the `OfflineRecognizer` Moonshine batch path. Pins that the
+    /// batch `OnlineRecognizer` path produces non-empty text for the known
+    /// 6.6 s test WAV and that the model was actually run (elapsed > 0).
+    #[test]
+    fn transcribe_real_audio_via_online_recognizer_batch_path() {
+        let _lock = model_lock();
+        let Some(models) = repo_models_dir() else {
+            return;
+        };
+        // Use the test WAV shipped with whichever streaming model dir is
+        // installed (both carry the same "After early nightfall..." file).
+        let wav = if let Some(p) = Asr::find_nemotron(&models) {
+            p.dir.join("test_wavs/0.wav")
+        } else if let Ok(p) = Asr::resolve_zipformer_paths(&models) {
+            p.dir.join("test_wavs/0.wav")
+        } else {
+            return;
+        };
+        if !wav.is_file() {
+            return;
+        }
+        // Streaming selection loads Nemotron (preferred) or Zipformer
+        // (fallback); both use `OnlineRecognizer` in `transcribe()`.
+        let asr = match Asr::new(&models, 2, BackendSelection::Streaming) {
+            Ok(a) => a,
+            Err(_) => return,
+        };
+        assert!(
+            asr.is_streaming(),
+            "expected a streaming backend, got {:?}",
+            asr.kind()
+        );
+        let wave =
+            sherpa_onnx::Wave::read(wav.to_str().expect("utf-8 path")).expect("read test wav");
+        let samples = wave.samples().to_vec();
+        assert!(samples.len() > 16000, "test wav should be at least 1 s");
+
+        let (text, elapsed) = asr.transcribe(&samples);
+        assert!(
+            !text.is_empty(),
+            "batch OnlineRecognizer path must produce non-empty text for real speech"
+        );
+        assert!(
+            elapsed > std::time::Duration::ZERO,
+            "batch OnlineRecognizer path must actually run the model"
+        );
+        let lower = text.to_lowercase();
+        assert!(
+            lower.contains("yellow lamps"),
+            "unexpected batch transcription: {text:?}"
+        );
+    }
+
     #[test]
     fn check_models_dir_reports_missing_dir() {
         let models = models_dir();
