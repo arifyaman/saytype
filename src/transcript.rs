@@ -540,6 +540,59 @@ mod tests {
     }
 
     #[test]
+    fn empty_final_drops_partial_erasures_but_keeps_committed() {
+        let mut t = Transcript::new();
+        t.feed_final("hello world");
+        // One utterance in progress; erase its partial words, then erase
+        // past the (now empty) partial into the committed text, so the undo
+        // stack holds both a Partial and a Committed entry at once.
+        t.feed_partial("again there");
+        assert!(t.erase_last()); // "there" (partial)
+        assert!(t.erase_last()); // "again" (partial)
+        assert!(t.erase_last()); // "world" (committed)
+        assert_eq!(t.display(), "Hello");
+        // The utterance finalizes with no content (empty final): the partial
+        // erasures had nothing left to point at and are dropped, but the
+        // committed erasure is from an earlier segment and stays restorable.
+        t.feed_final("");
+        assert_eq!(t.display(), "Hello");
+        assert!(t.undo_last());
+        assert_eq!(t.display(), "Hello world");
+        // Nothing else is restorable: the partial erasures were dropped.
+        assert!(!t.undo_last());
+    }
+
+    #[test]
+    fn empty_final_creates_no_segment() {
+        let mut t = Transcript::new();
+        t.feed_final("hello");
+        // An empty final must not add an (empty) segment: the committed text
+        // is unchanged and a later real segment joins with one space.
+        t.feed_final("");
+        assert_eq!(t.display(), "Hello");
+        t.feed_final("big world");
+        assert_eq!(t.display(), "Hello Big world");
+        // Fully empty from the start: still inert.
+        let mut e = Transcript::new();
+        e.feed_final("");
+        assert_eq!(e.display(), "");
+    }
+
+    #[test]
+    fn empty_batch_final_makes_pending_committed_erasure_permanent() {
+        let mut t = Transcript::new();
+        t.feed_batch_final("hello world");
+        assert!(t.erase_last()); // "world" pending committed erasure
+        assert_eq!(t.display(), "Hello");
+        // A new (empty) batch utterance finalizes: unlike the streaming
+        // feed_final(""), the pending erasure is flushed to a permanent gap -
+        // a whole new utterance was transcribed, whatever it said.
+        t.feed_batch_final("");
+        assert_eq!(t.display(), "Hello");
+        assert!(!t.undo_last());
+    }
+
+    #[test]
     fn batch_path_erase_undo_and_new_final_flushes() {
         let mut t = Transcript::new();
         t.feed_batch_final("one two three");
