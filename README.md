@@ -109,7 +109,7 @@ Canary, SenseVoice, ...) are not picked up today.
 
 ```sh
 cargo build --release        # binary at target/release/saytype
-cargo test                   # unit tests (transcript incl. empty-final edge cases, injector incl. clipboard fallback + deferred-paste pipeline, audio format conversion, VAD AudioRing + gated real-model Silero detection, ASR model detection + polish + backend fallback + real-model streaming round trip, daemon stable-target logic + toggle debounce + all three typing-mode injector sequences (live and final-only against a faked ydotool) + gated real-model streaming and batch pipeline tasks, config)
+cargo test                   # unit tests (transcript incl. empty-final edge cases, injector incl. clipboard fallback + deferred-paste pipeline, audio format conversion, VAD AudioRing + gated real-model Silero detection, ASR model detection + polish + backend fallback + empty/short-input guard + real-model streaming round trip, daemon stable-target logic + toggle debounce + all three typing-mode injector sequences (live and final-only against a faked ydotool) + gated real-model streaming and batch pipeline tasks, config)
 cargo run                    # run the daemon manually (needs models/ + session bus)
 journalctl --user -u saytype -f
 gdbus monitor --session --dest io.saytype.Dictate --object-path /io/saytype/Dictate

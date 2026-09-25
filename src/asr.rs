@@ -43,6 +43,15 @@ use std::time::Instant;
 
 const SAMPLE_RATE: i32 = 16000;
 
+/// The minimum input the batch `transcribe` will actually run the model on:
+/// 100 ms, the same threshold the live pipeline's blip filter uses to drop
+/// sub-100 ms VAD segments as noise. Nothing shorter can be a complete
+/// utterance, and feeding degenerate shapes to the model is not free:
+/// Moonshine's onnxruntime conv stack logs a scary "Invalid input shape"
+/// error block for short inputs (verified live, even at 512 samples) instead
+/// of quietly returning empty.
+const MIN_TRANSCRIBE_SAMPLES: usize = SAMPLE_RATE as usize / 10;
+
 /// Which ASR backend to load. `Auto` prefers Nemotron streaming, then
 /// Zipformer streaming, then Moonshine (the mvp2 default is the Nemotron
 /// streaming backend); `Streaming` picks the best streaming backend
@@ -404,6 +413,12 @@ impl Asr {
     }
 
     pub fn transcribe(&self, samples: &[f32]) -> (String, std::time::Duration) {
+        if samples.len() < MIN_TRANSCRIBE_SAMPLES {
+            // Degenerate input (an empty or truncated WAV): no utterance to
+            // decode; answer without touching the model (see
+            // MIN_TRANSCRIBE_SAMPLES).
+            return (String::new(), std::time::Duration::ZERO);
+        }
         let start = Instant::now();
         let raw = match &self.backend {
             Backend::Nemotron(recognizer) | Backend::Zipformer(recognizer) => {
@@ -1027,6 +1042,52 @@ mod tests {
             final_text2.to_lowercase().contains("yellow lamps"),
             "unexpected second final: {final_text2:?}"
         );
+    }
+
+    /// `--transcribe` may be handed a truncated or empty WAV. Input shorter
+    /// than `MIN_TRANSCRIBE_SAMPLES` (100 ms, the live pipeline's blip
+    /// filter threshold) cannot be a complete utterance: it must return
+    /// empty text WITHOUT running the model at all - besides being a wasted
+    /// decode, Moonshine's onnxruntime conv stack logs a scary "Invalid
+    /// input shape" error block for short inputs (verified live, even at
+    /// 512 samples). Exactly 100 ms of silence still reaches the model and
+    /// must complete cleanly with empty text (skipped when a backend's
+    /// model dir is absent).
+    #[test]
+    fn transcribe_empty_and_short_audio_returns_empty_without_crashing() {
+        let _lock = model_lock();
+        let Some(models) = repo_models_dir() else {
+            return;
+        };
+        // Auto loads the preferred streaming backend (Nemotron where
+        // installed, else Zipformer - the same `OnlineRecognizer` FFI
+        // surface); Moonshine is the separate `OfflineRecognizer` surface.
+        for selection in [BackendSelection::Auto, BackendSelection::Moonshine] {
+            let Ok(asr) = Asr::new(&models, 1, selection) else {
+                continue; // backend not installed on this machine
+            };
+            // Empty input and the boundary just below the threshold: guarded,
+            // no model round trip.
+            for n in [0usize, MIN_TRANSCRIBE_SAMPLES - 1] {
+                let (text, elapsed) = asr.transcribe(&vec![0.0f32; n]);
+                assert!(
+                    text.is_empty(),
+                    "{selection:?}: {n} samples must give empty text, got {text:?}"
+                );
+                assert_eq!(
+                    elapsed,
+                    std::time::Duration::ZERO,
+                    "{selection:?}: {n} samples must not run the model"
+                );
+            }
+            // Exactly the threshold of pure silence: reaches the model (no
+            // guard) and must still complete with empty text.
+            let (text, _) = asr.transcribe(&vec![0.0f32; MIN_TRANSCRIBE_SAMPLES]);
+            assert!(
+                text.is_empty(),
+                "{selection:?}: 100 ms of silence must give empty text, got {text:?}"
+            );
+        }
     }
 
     #[test]
