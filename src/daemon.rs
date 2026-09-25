@@ -1351,6 +1351,91 @@ mod tests {
             "unexpected final: {finals:?}"
         );
     }
+
+    /// The batch pipeline (Moonshine path), end to end, on the real VAD +
+    /// real Moonshine model + real speech (silently skipped when `models/`
+    /// lacks the Moonshine backend, its VAD, or a 16 kHz test WAV): feed a
+    /// 16 kHz utterance in 512-sample frames in one burst (the batch path
+    /// has no wall-clock cadence, unlike `stream_task`) through the exact
+    /// production wiring - `vad_task` (ring-padded segments) -> `asr_task`
+    /// - and pin the documented contract: exactly one `Final` per
+    /// utterance, and - unlike the streaming path - never a `Partial`.
+    // The model-serialization lock is a bare unit flag whose whole purpose
+    // is to span the test's model load *and* decode phase, so holding it
+    // across the awaits is intentional (the sync real-model tests in asr/
+    // vad hold it the same way; a tokio mutex would not work there).
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn batch_pipeline_emits_one_final_per_utterance_and_no_partials() {
+        let _lock = model_lock();
+        let Some(models) = repo_models_dir() else {
+            return;
+        };
+        let asr = match Asr::new(&models, 2, BackendSelection::Moonshine) {
+            Ok(a) => a,
+            Err(_) => return,
+        };
+        let vad = match Vad::new(&VadConfig::from_models_dir(&models)) {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+        // The 16 kHz fixture ships with the streaming model dirs (the
+        // Moonshine dir's own test WAV is 24 kHz and would garble the
+        // 16 kHz-only VAD), same selection as the streaming pipeline test.
+        let wav = if let Some(p) = Asr::find_nemotron(&models) {
+            p.dir.join("test_wavs/0.wav")
+        } else if let Ok(p) = Asr::resolve_zipformer_paths(&models) {
+            p.dir.join("test_wavs/0.wav")
+        } else {
+            return;
+        };
+        if !wav.is_file() {
+            return;
+        }
+        let wave =
+            sherpa_onnx::Wave::read(wav.to_str().expect("utf-8 path")).expect("read test wav");
+        assert_eq!(wave.sample_rate(), 16000, "fixture must be 16 kHz");
+        let frames: Vec<Vec<f32>> = wave.samples().chunks(512).map(|c| c.to_vec()).collect();
+
+        // The exact wiring `Engine::start` uses for the batch backend,
+        // including the 30 s lookback ring the VAD task slices padding
+        // from (max segment 20 s + padding).
+        let (frames_tx, frames_rx) = mpsc::channel::<Vec<f32>>(128);
+        let (segs_tx, segs_rx) = mpsc::channel::<Vec<f32>>(16);
+        let (out_tx, mut out_rx) = mpsc::channel::<InjectorInput>(16);
+        let vad_handle = tokio::spawn(vad_task(
+            vad,
+            AudioRing::new(30 * audio::SAMPLE_RATE as usize),
+            frames_rx,
+            segs_tx,
+        ));
+        let asr_handle = tokio::spawn(asr_task(std::sync::Arc::new(asr), segs_rx, out_tx));
+
+        // One burst: the VAD finalizes the utterance on the trailing
+        // silence inside the WAV; when the source ends, `vad_task` flushes
+        // (nothing left) and exits, closing the segment channel, which
+        // ends `asr_task` after it drains.
+        for frame in &frames {
+            frames_tx.send(frame.clone()).await.unwrap();
+        }
+        drop(frames_tx);
+        vad_handle.await.unwrap();
+        asr_handle.await.unwrap();
+
+        let mut finals = Vec::new();
+        while let Ok(input) = out_rx.try_recv() {
+            match input {
+                // The batch path has no live hypotheses: only finals.
+                InjectorInput::Asr(AsrOutput::Final(text)) => finals.push(text),
+                other => panic!("the batch path never emits partials: {other:?}"),
+            }
+        }
+        assert_eq!(finals.len(), 1, "the WAV holds one utterance: {finals:?}");
+        assert!(
+            finals[0].to_lowercase().contains("yellow lamps"),
+            "unexpected final: {finals:?}"
+        );
+    }
 }
 
 #[cfg(test)]
