@@ -149,7 +149,9 @@ fn parse_asr_selection(args: &[String]) -> (Vec<String>, asr::BackendSelection) 
 fn run_transcribe(args: &[String]) {
     let (rest, selection) = parse_asr_selection(args);
     if rest.is_empty() {
-        eprintln!("usage: saytype --transcribe [--asr auto|streaming|zipformer|moonshine] <file.wav>");
+        eprintln!(
+            "usage: saytype --transcribe [--asr auto|streaming|zipformer|moonshine] <file.wav>"
+        );
         std::process::exit(2);
     }
     let path = rest[0].clone();
@@ -482,7 +484,10 @@ mod models_dir_tests {
         fs::create_dir(cwd.path().join("models")).unwrap();
         let exe = tempfile::tempdir().unwrap();
         fs::create_dir(exe.path().join("models")).unwrap();
-        let got = resolve_models_dir(Some(cwd.path().to_path_buf()), Some(exe.path().to_path_buf()));
+        let got = resolve_models_dir(
+            Some(cwd.path().to_path_buf()),
+            Some(exe.path().to_path_buf()),
+        );
         assert_eq!(got, cwd.path().join("models"));
     }
 
@@ -515,16 +520,25 @@ mod asr_selection_tests {
             parse_asr_value("moonshine"),
             Some(asr::BackendSelection::Moonshine)
         );
-        assert_eq!(
-            parse_asr_value("auto"),
-            Some(asr::BackendSelection::Auto)
-        );
+        assert_eq!(parse_asr_value("auto"), Some(asr::BackendSelection::Auto));
     }
 
     #[test]
     fn parse_asr_value_rejects_unknown_and_malformed_values() {
-        for bad in ["", "STREAMING", "auto ", " streaming", "nemotron", "vad", "auto/streaming"] {
-            assert_eq!(parse_asr_value(bad), None, "expected {bad:?} to be rejected");
+        for bad in [
+            "",
+            "STREAMING",
+            "auto ",
+            " streaming",
+            "nemotron",
+            "vad",
+            "auto/streaming",
+        ] {
+            assert_eq!(
+                parse_asr_value(bad),
+                None,
+                "expected {bad:?} to be rejected"
+            );
         }
     }
 

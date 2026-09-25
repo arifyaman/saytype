@@ -146,7 +146,11 @@ impl Transcript {
     fn committed_text(&self) -> String {
         let mut segs: Vec<String> = Vec::new();
         let mut prev = 0usize;
-        for &end in self.segment_starts.iter().chain(std::iter::once(&self.committed.len())) {
+        for &end in self
+            .segment_starts
+            .iter()
+            .chain(std::iter::once(&self.committed.len()))
+        {
             let t = self.segment_text(prev, end);
             if !t.is_empty() {
                 segs.push(t);
@@ -236,8 +240,11 @@ impl Transcript {
         }
         // Append the segment: permanently erased positions become gaps.
         for (i, tok) in tokens.into_iter().enumerate() {
-            self.committed
-                .push(if self.erased.contains(&i) { None } else { Some(tok) });
+            self.committed.push(if self.erased.contains(&i) {
+                None
+            } else {
+                Some(tok)
+            });
         }
         if base < self.committed.len() {
             self.segment_starts.push(base);
@@ -516,9 +523,9 @@ mod tests {
         let mut t = Transcript::new();
         t.feed_final("hello world");
         assert!(t.erase_last()); // "world" pending (committed slot)
-        // A new utterance finalizes with words no partial showed: the
-        // pending committed erasure is permanent, leaving a gap that a
-        // later segment's casing ignores.
+                                 // A new utterance finalizes with words no partial showed: the
+                                 // pending committed erasure is permanent, leaving a gap that a
+                                 // later segment's casing ignores.
         t.feed_final("new text here");
         assert_eq!(t.display(), "Hello New text here");
         assert!(!t.undo_last());
@@ -773,12 +780,12 @@ mod tests {
         let mut t = Transcript::new();
         t.feed_partial("a b c d e");
         assert!(t.erase_last()); // e (position 4)
-        // The decoder collapses the tail: "d" and "e" drop out of the
-        // partial. No new word, so the erasure stays restorable.
+                                 // The decoder collapses the tail: "d" and "e" drop out of the
+                                 // partial. No new word, so the erasure stays restorable.
         t.feed_partial("a b");
         assert!(t.erase_last()); // b (position 1)
-        // The final re-expands to all five words: both erasures survive as
-        // committed-slot erasures.
+                                 // The final re-expands to all five words: both erasures survive as
+                                 // committed-slot erasures.
         t.feed_final("a b c d e");
         assert_eq!(t.display(), "A c d");
         // Undo restores "b" to its original position (between "a" and

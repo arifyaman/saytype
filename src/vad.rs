@@ -168,7 +168,7 @@ pub fn check_model_file(path: &Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{AudioRing, Vad, VadConfig, VadParams, check_model_file};
+    use super::{check_model_file, AudioRing, Vad, VadConfig, VadParams};
     use crate::testutil::{model_lock, repo_models_dir};
     use std::path::Path;
 
@@ -363,7 +363,10 @@ mod tests {
         .err()
         .expect("error expected")
         .to_string();
-        assert!(err.contains("failed to create VAD"), "unexpected error: {err}");
+        assert!(
+            err.contains("failed to create VAD"),
+            "unexpected error: {err}"
+        );
     }
 
     /// The 16 kHz mono test WAV shipped inside the model dirs, if any model
@@ -441,11 +444,15 @@ mod tests {
     #[test]
     fn vad_detects_speech_and_reports_absolute_start() {
         let _lock = model_lock();
-        let Some(models) = repo_models_dir() else { return };
-        let Some(wav_path) = test_wav(&models) else { return };
+        let Some(models) = repo_models_dir() else {
+            return;
+        };
+        let Some(wav_path) = test_wav(&models) else {
+            return;
+        };
         let Some(vad) = real_vad() else { return };
-        let wave = sherpa_onnx::Wave::read(wav_path.to_str().expect("utf-8"))
-            .expect("read test wav");
+        let wave =
+            sherpa_onnx::Wave::read(wav_path.to_str().expect("utf-8")).expect("read test wav");
         let samples = wave.samples().to_vec();
         assert!(samples.len() > 16000, "test wav should be at least 1 s");
 
@@ -459,7 +466,10 @@ mod tests {
                 saw_detection = true;
             }
         }
-        assert!(saw_detection, "no in-progress detection while feeding speech");
+        assert!(
+            saw_detection,
+            "no in-progress detection while feeding speech"
+        );
 
         // The default min_silence_duration is 0.8 s; 1.0 s finalizes it.
         vad.feed(&vec![0.0f32; 16000]);
@@ -469,7 +479,10 @@ mod tests {
             starts.push(start);
             total += seg.len();
         }
-        assert!(!starts.is_empty(), "no finalized segment after trailing silence");
+        assert!(
+            !starts.is_empty(),
+            "no finalized segment after trailing silence"
+        );
         assert!(
             total > 16000,
             "finalized audio shorter than 1 s: {total} samples"
@@ -490,11 +503,15 @@ mod tests {
     #[test]
     fn vad_flush_finalizes_trailing_utterance() {
         let _lock = model_lock();
-        let Some(models) = repo_models_dir() else { return };
-        let Some(wav_path) = test_wav(&models) else { return };
+        let Some(models) = repo_models_dir() else {
+            return;
+        };
+        let Some(wav_path) = test_wav(&models) else {
+            return;
+        };
         let Some(vad) = real_vad() else { return };
-        let wave = sherpa_onnx::Wave::read(wav_path.to_str().expect("utf-8"))
-            .expect("read test wav");
+        let wave =
+            sherpa_onnx::Wave::read(wav_path.to_str().expect("utf-8")).expect("read test wav");
         let samples = wave.samples().to_vec();
         vad.feed(&samples);
         vad.flush();

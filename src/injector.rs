@@ -207,7 +207,16 @@ pub async fn backspaces(n: u32) -> io::Result<()> {
     }
     with_timeout("ydotool key Backspace", async {
         let output = tokio::process::Command::new("ydotool")
-            .args(["key", "--repeat", &n.to_string(), "--delay", "0", "--repeat-delay", "0", "Backspace"])
+            .args([
+                "key",
+                "--repeat",
+                &n.to_string(),
+                "--delay",
+                "0",
+                "--repeat-delay",
+                "0",
+                "Backspace",
+            ])
             .output()
             .await
             .map_err(|e| {
@@ -364,8 +373,14 @@ mod tests {
         let _guard = crate::testutil::TOOL_SPAWN_LOCK.lock().await;
         let tmp = tempfile::tempdir().unwrap();
         let out = tmp.path().join("got.txt");
-        let tool = make_fake_tool(tmp.path(), "tool", &format!("#!/bin/sh\ncat > {}\n", out.display()));
-        try_clipboard_tools("hello clipboard", &[(tool.as_str(), &[])]).await.unwrap();
+        let tool = make_fake_tool(
+            tmp.path(),
+            "tool",
+            &format!("#!/bin/sh\ncat > {}\n", out.display()),
+        );
+        try_clipboard_tools("hello clipboard", &[(tool.as_str(), &[])])
+            .await
+            .unwrap();
         assert_eq!(std::fs::read_to_string(&out).unwrap(), "hello clipboard");
     }
 
@@ -374,7 +389,9 @@ mod tests {
         let _guard = crate::testutil::TOOL_SPAWN_LOCK.lock().await;
         let tmp = tempfile::tempdir().unwrap();
         let tool = make_fake_tool(tmp.path(), "tool", "#!/bin/sh\necho boom >&2\nexit 1\n");
-        let err = try_clipboard_tools("x", &[(tool.as_str(), &[])]).await.unwrap_err();
+        let err = try_clipboard_tools("x", &[(tool.as_str(), &[])])
+            .await
+            .unwrap_err();
         assert!(err.to_string().contains("boom"), "{err}");
     }
 
@@ -382,7 +399,9 @@ mod tests {
     async fn clipboard_missing_tool_is_an_error() {
         let _guard = crate::testutil::TOOL_SPAWN_LOCK.lock().await;
         // A nonexistent command fails at spawn time, before any timeout.
-        let err = try_clipboard_tools("x", &[("/nonexistent/clipboard-tool-xyz", &[])]).await.unwrap_err();
+        let err = try_clipboard_tools("x", &[("/nonexistent/clipboard-tool-xyz", &[])])
+            .await
+            .unwrap_err();
         assert!(matches!(err.kind(), io::ErrorKind::NotFound), "{err}");
     }
 
@@ -395,7 +414,9 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let tool = make_fake_tool(tmp.path(), "tool", "#!/bin/sh\nsleep 2\n");
         let start = std::time::Instant::now();
-        try_clipboard_tools("x", &[(tool.as_str(), &[])]).await.unwrap();
+        try_clipboard_tools("x", &[(tool.as_str(), &[])])
+            .await
+            .unwrap();
         let elapsed = start.elapsed();
         assert!(elapsed < Duration::from_secs(1), "took {elapsed:?}");
     }
@@ -406,21 +427,28 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let bad = make_fake_tool(tmp.path(), "bad", "#!/bin/sh\nexit 1\n");
         let good = make_fake_tool(tmp.path(), "good", "#!/bin/sh\ncat >/dev/null\n");
-        try_clipboard_tools("x", &[(bad.as_str(), &[]), (good.as_str(), &[])]).await.unwrap();
+        try_clipboard_tools("x", &[(bad.as_str(), &[]), (good.as_str(), &[])])
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
     async fn clipboard_all_tools_fail_returns_last_error() {
         let _guard = crate::testutil::TOOL_SPAWN_LOCK.lock().await;
         let tmp = tempfile::tempdir().unwrap();
-        let first = make_fake_tool(tmp.path(), "first", "#!/bin/sh\necho first-fail >&2\nexit 1\n");
-        let second = make_fake_tool(tmp.path(), "second", "#!/bin/sh\necho second-fail >&2\nexit 1\n");
-        let err = try_clipboard_tools(
-            "x",
-            &[(first.as_str(), &[]), (second.as_str(), &[])],
-        )
-        .await
-        .unwrap_err();
+        let first = make_fake_tool(
+            tmp.path(),
+            "first",
+            "#!/bin/sh\necho first-fail >&2\nexit 1\n",
+        );
+        let second = make_fake_tool(
+            tmp.path(),
+            "second",
+            "#!/bin/sh\necho second-fail >&2\nexit 1\n",
+        );
+        let err = try_clipboard_tools("x", &[(first.as_str(), &[]), (second.as_str(), &[])])
+            .await
+            .unwrap_err();
         assert!(err.to_string().contains("second-fail"), "{err}");
     }
 
@@ -447,7 +475,14 @@ mod tests {
     async fn type_text_passes_leading_dash_text_after_end_of_options() {
         let tmp = tempfile::tempdir().unwrap();
         let d = tmp.path();
-        make_fake_tool(d, "ydotool", &format!("#!/bin/sh\nprintf '%s\\n' \"$@\" > {}\n", d.join("ydotool.log").display()));
+        make_fake_tool(
+            d,
+            "ydotool",
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > {}\n",
+                d.join("ydotool.log").display()
+            ),
+        );
         let _env = EnvPatch::new(d, true).await;
         type_text("- two hyphenated items").await.unwrap();
         assert_eq!(
@@ -464,18 +499,39 @@ mod tests {
     async fn paste_text_copies_via_wl_copy_then_pastes_under_wayland() {
         let tmp = tempfile::tempdir().unwrap();
         let d = tmp.path();
-        make_fake_tool(d, "wl-copy", &format!("#!/bin/sh\ncat > {}\n", d.join("wl-copy.log").display()));
+        make_fake_tool(
+            d,
+            "wl-copy",
+            &format!("#!/bin/sh\ncat > {}\n", d.join("wl-copy.log").display()),
+        );
         make_fake_tool(
             d,
             "xclip",
-            &format!("#!/bin/sh\nprintf '%s ' \"$@\" > {}\ncat > {}\n", d.join("xclip.args").display(), d.join("xclip.log").display()),
+            &format!(
+                "#!/bin/sh\nprintf '%s ' \"$@\" > {}\ncat > {}\n",
+                d.join("xclip.args").display(),
+                d.join("xclip.log").display()
+            ),
         );
-        make_fake_tool(d, "ydotool", &format!("#!/bin/sh\nprintf '%s\\n' \"$@\" > {}\n", d.join("ydotool.log").display()));
+        make_fake_tool(
+            d,
+            "ydotool",
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > {}\n",
+                d.join("ydotool.log").display()
+            ),
+        );
         let _env = EnvPatch::new(d, true).await;
         paste_text("hello world").await.unwrap();
-        assert_eq!(std::fs::read_to_string(d.join("wl-copy.log")).unwrap(), "hello world");
+        assert_eq!(
+            std::fs::read_to_string(d.join("wl-copy.log")).unwrap(),
+            "hello world"
+        );
         assert!(!d.join("xclip.log").exists());
-        assert_eq!(std::fs::read_to_string(d.join("ydotool.log")).unwrap(), "key\nctrl+v\n");
+        assert_eq!(
+            std::fs::read_to_string(d.join("ydotool.log")).unwrap(),
+            "key\nctrl+v\n"
+        );
     }
 
     /// The same pipeline on an X11 session: xclip is tried first and must
@@ -486,19 +542,43 @@ mod tests {
     async fn paste_text_prefers_xclip_under_x11_and_passes_selection_arg() {
         let tmp = tempfile::tempdir().unwrap();
         let d = tmp.path();
-        make_fake_tool(d, "wl-copy", &format!("#!/bin/sh\ncat > {}\n", d.join("wl-copy.log").display()));
+        make_fake_tool(
+            d,
+            "wl-copy",
+            &format!("#!/bin/sh\ncat > {}\n", d.join("wl-copy.log").display()),
+        );
         make_fake_tool(
             d,
             "xclip",
-            &format!("#!/bin/sh\nprintf '%s ' \"$@\" > {}\ncat > {}\n", d.join("xclip.args").display(), d.join("xclip.log").display()),
+            &format!(
+                "#!/bin/sh\nprintf '%s ' \"$@\" > {}\ncat > {}\n",
+                d.join("xclip.args").display(),
+                d.join("xclip.log").display()
+            ),
         );
-        make_fake_tool(d, "ydotool", &format!("#!/bin/sh\nprintf '%s\\n' \"$@\" > {}\n", d.join("ydotool.log").display()));
+        make_fake_tool(
+            d,
+            "ydotool",
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > {}\n",
+                d.join("ydotool.log").display()
+            ),
+        );
         let _env = EnvPatch::new(d, false).await;
         paste_text("hi there").await.unwrap();
-        assert_eq!(std::fs::read_to_string(d.join("xclip.log")).unwrap(), "hi there");
-        assert_eq!(std::fs::read_to_string(d.join("xclip.args")).unwrap(), "-selection clipboard ");
+        assert_eq!(
+            std::fs::read_to_string(d.join("xclip.log")).unwrap(),
+            "hi there"
+        );
+        assert_eq!(
+            std::fs::read_to_string(d.join("xclip.args")).unwrap(),
+            "-selection clipboard "
+        );
         assert!(!d.join("wl-copy.log").exists());
-        assert_eq!(std::fs::read_to_string(d.join("ydotool.log")).unwrap(), "key\nctrl+v\n");
+        assert_eq!(
+            std::fs::read_to_string(d.join("ydotool.log")).unwrap(),
+            "key\nctrl+v\n"
+        );
     }
 
     /// Safety property: if the clipboard cannot be set (both tools fail),
@@ -510,7 +590,14 @@ mod tests {
         let d = tmp.path();
         make_fake_tool(d, "wl-copy", "#!/bin/sh\necho clip-fail >&2\nexit 1\n");
         make_fake_tool(d, "xclip", "#!/bin/sh\necho xclip-fail >&2\nexit 1\n");
-        make_fake_tool(d, "ydotool", &format!("#!/bin/sh\nprintf '%s\\n' \"$@\" > {}\n", d.join("ydotool.log").display()));
+        make_fake_tool(
+            d,
+            "ydotool",
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > {}\n",
+                d.join("ydotool.log").display()
+            ),
+        );
         let _env = EnvPatch::new(d, true).await;
         // Both attempts fail: the error is the last one tried (xclip).
         let err = paste_text("x").await.unwrap_err();

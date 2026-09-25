@@ -81,10 +81,7 @@ impl EnvPatch {
         let spawn = TOOL_SPAWN_LOCK.lock().await;
         let old_path = std::env::var("PATH").unwrap_or_default();
         let old_wayland = std::env::var_os("WAYLAND_DISPLAY");
-        std::env::set_var(
-            "PATH",
-            format!("{}:{}", dir.display(), old_path),
-        );
+        std::env::set_var("PATH", format!("{}:{}", dir.display(), old_path));
         if wayland {
             std::env::set_var("WAYLAND_DISPLAY", "wayland-0");
         } else {

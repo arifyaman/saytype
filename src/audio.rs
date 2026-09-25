@@ -294,10 +294,7 @@ mod tests {
     fn assert_close(actual: &[f32], expected: &[f32], eps: f32) {
         assert_eq!(actual.len(), expected.len(), "length mismatch");
         for (a, e) in actual.iter().zip(expected) {
-            assert!(
-                (a - e).abs() <= eps,
-                "expected {e} +/- {eps}, got {a}"
-            );
+            assert!((a - e).abs() <= eps, "expected {e} +/- {eps}, got {a}");
         }
     }
 
@@ -360,7 +357,11 @@ mod tests {
         let mut bytes = bytes;
         bytes.push(0xFF);
         let out = pcm_to_mono_f32(&fmt, &bytes);
-        assert_close(&out, &[1000.0 / i16::MAX as f32, 2000.0 / i16::MAX as f32], 1e-6);
+        assert_close(
+            &out,
+            &[1000.0 / i16::MAX as f32, 2000.0 / i16::MAX as f32],
+            1e-6,
+        );
     }
 
     #[test]

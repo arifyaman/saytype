@@ -100,7 +100,9 @@ impl Asr {
                     match Self::create_zipformer(models_dir, num_threads) {
                         Ok(b) => b,
                         Err(e2) => {
-                            tracing::info!("no usable streaming Zipformer model ({e2}); trying Moonshine");
+                            tracing::info!(
+                                "no usable streaming Zipformer model ({e2}); trying Moonshine"
+                            );
                             Self::create_moonshine(models_dir, num_threads)?
                         }
                     }
@@ -109,7 +111,9 @@ impl Asr {
             BackendSelection::Streaming => match Self::create_nemotron(models_dir, num_threads) {
                 Ok(b) => b,
                 Err(e) => {
-                    tracing::info!("no usable Nemotron streaming model ({e}); falling back to Zipformer");
+                    tracing::info!(
+                        "no usable Nemotron streaming model ({e}); falling back to Zipformer"
+                    );
                     Self::create_zipformer(models_dir, num_threads)?
                 }
             },
@@ -118,7 +122,9 @@ impl Asr {
         };
         // The punct model is only useful for streaming backends.
         let punct = match &backend {
-            Backend::Nemotron(_) | Backend::Zipformer(_) => Self::create_punct(models_dir, num_threads),
+            Backend::Nemotron(_) | Backend::Zipformer(_) => {
+                Self::create_punct(models_dir, num_threads)
+            }
             Backend::Moonshine(_) => None,
         };
         Ok(Self { backend, punct })
@@ -145,9 +151,11 @@ impl Asr {
     /// punct model is available.
     pub fn streaming_session(&self) -> Option<StreamingSession<'_>> {
         match &self.backend {
-            Backend::Nemotron(recognizer) => {
-                Some(StreamingSession::new(recognizer, self.punct.as_ref(), false))
-            }
+            Backend::Nemotron(recognizer) => Some(StreamingSession::new(
+                recognizer,
+                self.punct.as_ref(),
+                false,
+            )),
             Backend::Zipformer(recognizer) => {
                 Some(StreamingSession::new(recognizer, self.punct.as_ref(), true))
             }
@@ -175,7 +183,10 @@ impl Asr {
         let paths = Self::find_nemotron(models_dir).with_context(|| {
             format!("no Nemotron streaming model found under {:?} (a sherpa-onnx-nemotron-speech-streaming-en-* dir with encoder/decoder/joiner *.onnx + tokens.txt)", models_dir)
         })?;
-        tracing::info!("ASR backend: nemotron speech streaming (en 0.6b) in {:?}", paths.dir);
+        tracing::info!(
+            "ASR backend: nemotron speech streaming (en 0.6b) in {:?}",
+            paths.dir
+        );
         let mut config = OnlineRecognizerConfig::default();
         config.model_config.transducer.encoder = Some(paths.encoder);
         config.model_config.transducer.decoder = Some(paths.decoder);
@@ -229,7 +240,11 @@ impl Asr {
         tracing::info!(
             "online punctuation model in {:?} ({})",
             paths.dir,
-            if paths.model.contains("int8") { "int8" } else { "fp32" }
+            if paths.model.contains("int8") {
+                "int8"
+            } else {
+                "fp32"
+            }
         );
         let config = OnlinePunctuationConfig {
             model: OnlinePunctuationModelConfig {
@@ -273,9 +288,7 @@ impl Asr {
         None
     }
 
-    pub(crate) fn resolve_zipformer_paths(
-        models_dir: &Path,
-    ) -> Result<ZipformerPaths> {
+    pub(crate) fn resolve_zipformer_paths(models_dir: &Path) -> Result<ZipformerPaths> {
         // Model artifacts get reorganized between releases, so instead of
         // hardcoding exact filenames we scan for a directory that contains an
         // encoder/decoder/joiner ONNX triple plus tokens.txt.
@@ -337,9 +350,7 @@ impl Asr {
             .filter(|p| {
                 p.is_dir()
                     && p.file_name()
-                        .map(|n| {
-                            n.to_string_lossy().starts_with("sherpa-onnx-online-punct")
-                        })
+                        .map(|n| n.to_string_lossy().starts_with("sherpa-onnx-online-punct"))
                         .unwrap_or(false)
             })
             .collect();
@@ -608,7 +619,10 @@ fn find_model(dir: &Path, stem: &str) -> Option<PathBuf> {
         .filter_map(|e| e.ok())
         .map(|e| e.path())
         .find(|p| {
-            let name = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            let name = p
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
             name.contains(stem) && (name.ends_with(".onnx") || name.ends_with(".ort"))
         })
 }
@@ -730,7 +744,10 @@ mod tests {
         assert_eq!(polish(None, "well-known words"), "well-known words");
         // Sentence marks are still stripped (alongside lowercasing) while the
         // hyphen and apostrophe survive.
-        assert_eq!(polish(None, "Well-known, don't? Stop!"), "well-known don't stop");
+        assert_eq!(
+            polish(None, "Well-known, don't? Stop!"),
+            "well-known don't stop"
+        );
         // All-caps hyphenated phrase with a trailing mark.
         assert_eq!(polish(None, "STATE-OF-THE-ART?"), "state-of-the-art");
     }
@@ -785,12 +802,16 @@ mod tests {
         let d = sub(models.path(), "n");
         file(&d, "encoder.onnx");
         assert_eq!(
-            find_onnx_preferring_int8(&d, "encoder").as_ref().map(file_name),
+            find_onnx_preferring_int8(&d, "encoder")
+                .as_ref()
+                .map(file_name),
             Some("encoder.onnx".to_string())
         );
         file(&d, "encoder.int8.onnx");
         assert_eq!(
-            find_onnx_preferring_int8(&d, "encoder").as_ref().map(file_name),
+            find_onnx_preferring_int8(&d, "encoder")
+                .as_ref()
+                .map(file_name),
             Some("encoder.int8.onnx".to_string())
         );
 
@@ -859,21 +880,29 @@ mod tests {
     fn find_nemotron_requires_triple_and_tokens() {
         let models = models_dir();
         // Sorted first but missing the joiner: skipped.
-        let broken = sub(models.path(), "sherpa-onnx-nemotron-speech-streaming-en-0.6b-broken");
+        let broken = sub(
+            models.path(),
+            "sherpa-onnx-nemotron-speech-streaming-en-0.6b-broken",
+        );
         file(&broken, "encoder.int8.onnx");
         file(&broken, "decoder.int8.onnx");
         file(&broken, "tokens.txt");
         assert!(Asr::find_nemotron(models.path()).is_none());
 
         // Complete dir is found and the int8 variants are picked.
-        let ok = sub(models.path(), "sherpa-onnx-nemotron-speech-streaming-en-0.6b");
+        let ok = sub(
+            models.path(),
+            "sherpa-onnx-nemotron-speech-streaming-en-0.6b",
+        );
         file(&ok, "encoder.onnx");
         file(&ok, "encoder.int8.onnx");
         file(&ok, "decoder.int8.onnx");
         file(&ok, "joiner.int8.onnx");
         file(&ok, "tokens.txt");
         let p = Asr::find_nemotron(models.path()).expect("complete dir found");
-        assert!(p.dir.ends_with("sherpa-onnx-nemotron-speech-streaming-en-0.6b"));
+        assert!(p
+            .dir
+            .ends_with("sherpa-onnx-nemotron-speech-streaming-en-0.6b"));
         assert_eq!(file_name(p.encoder), "encoder.int8.onnx");
         assert_eq!(file_name(p.decoder), "decoder.int8.onnx");
         assert_eq!(file_name(p.joiner), "joiner.int8.onnx");
@@ -892,8 +921,13 @@ mod tests {
     fn resolve_zipformer_paths_ok_and_error() {
         let models = models_dir();
         // No matching dir at all: Err with a helpful message.
-        let err = Asr::resolve_zipformer_paths(models.path()).expect_err("error expected").to_string();
-        assert!(err.contains("no ASR model found"), "unexpected error: {err}");
+        let err = Asr::resolve_zipformer_paths(models.path())
+            .expect_err("error expected")
+            .to_string();
+        assert!(
+            err.contains("no ASR model found"),
+            "unexpected error: {err}"
+        );
 
         // Complete dir resolves with the epoch-tagged files.
         let ok = sub(
@@ -905,7 +939,9 @@ mod tests {
         file(&ok, "joiner-epoch-99-avg-1.onnx");
         file(&ok, "tokens.txt");
         let p = Asr::resolve_zipformer_paths(models.path()).expect("complete dir resolves");
-        assert!(p.dir.ends_with("sherpa-onnx-streaming-zipformer-bilingual-zh-en-2023-02-20"));
+        assert!(p
+            .dir
+            .ends_with("sherpa-onnx-streaming-zipformer-bilingual-zh-en-2023-02-20"));
         assert_eq!(file_name(p.encoder), "encoder-epoch-99-avg-1.onnx");
         assert_eq!(file_name(p.decoder), "decoder-epoch-99-avg-1.onnx");
         assert_eq!(file_name(p.joiner), "joiner-epoch-99-avg-1.onnx");
@@ -923,8 +959,14 @@ mod tests {
             BackendSelection::Zipformer,
             BackendSelection::Moonshine,
         ] {
-            let err = Asr::new(models.path(), 1, selection).err().expect("error expected").to_string();
-            assert!(!err.is_empty(), "{selection:?} should error on an empty models dir");
+            let err = Asr::new(models.path(), 1, selection)
+                .err()
+                .expect("error expected")
+                .to_string();
+            assert!(
+                !err.is_empty(),
+                "{selection:?} should error on an empty models dir"
+            );
         }
     }
 
@@ -935,12 +977,18 @@ mod tests {
         // Zipformer dir whose encoder lacks the "epoch" tag. Neither is a
         // candidate, so no backend may be *selected* (and then fail to
         // load) - the chain must fall through to the detection errors.
-        let broken_n = sub(models.path(), "sherpa-onnx-nemotron-speech-streaming-en-0.6b");
+        let broken_n = sub(
+            models.path(),
+            "sherpa-onnx-nemotron-speech-streaming-en-0.6b",
+        );
         file(&broken_n, "encoder.int8.onnx");
         file(&broken_n, "decoder.int8.onnx");
         file(&broken_n, "tokens.txt");
 
-        let broken_z = sub(models.path(), "sherpa-onnx-streaming-zipformer-bilingual-zh-en");
+        let broken_z = sub(
+            models.path(),
+            "sherpa-onnx-streaming-zipformer-bilingual-zh-en",
+        );
         file(&broken_z, "encoder.onnx"); // no "epoch" in the name
         file(&broken_z, "decoder-epoch-99.onnx");
         file(&broken_z, "joiner-epoch-99.onnx");
@@ -952,26 +1000,38 @@ mod tests {
             .err()
             .expect("error expected")
             .to_string();
-        assert!(err.contains("no Moonshine model found"), "unexpected error: {err}");
+        assert!(
+            err.contains("no Moonshine model found"),
+            "unexpected error: {err}"
+        );
 
         // Streaming stops after the zipformer stage (no moonshine fallback).
         let err = Asr::new(models.path(), 1, BackendSelection::Streaming)
             .err()
             .expect("error expected")
             .to_string();
-        assert!(err.contains("no ASR model found"), "unexpected error: {err}");
+        assert!(
+            err.contains("no ASR model found"),
+            "unexpected error: {err}"
+        );
 
         // Forced backends report their own detection failure, not a load error.
         let err = Asr::new(models.path(), 1, BackendSelection::Zipformer)
             .err()
             .expect("error expected")
             .to_string();
-        assert!(err.contains("no ASR model found"), "unexpected error: {err}");
+        assert!(
+            err.contains("no ASR model found"),
+            "unexpected error: {err}"
+        );
         let err = Asr::new(models.path(), 1, BackendSelection::Moonshine)
             .err()
             .expect("error expected")
             .to_string();
-        assert!(err.contains("no Moonshine model found"), "unexpected error: {err}");
+        assert!(
+            err.contains("no Moonshine model found"),
+            "unexpected error: {err}"
+        );
     }
 
     /// `polish` with a real online-punctuation model (skipped when the
@@ -991,7 +1051,10 @@ mod tests {
         // The model capitalizes sentence starts (its capitalization is a
         // learned behavior, not a regex: it may also cap some other words).
         assert_eq!(polish(Some(&p), "hello world"), "Hello World");
-        assert_eq!(polish(Some(&p), "the quick brown fox"), "The quick brown fox");
+        assert_eq!(
+            polish(Some(&p), "the quick brown fox"),
+            "The quick brown fox"
+        );
         // Deterministic across calls.
         assert_eq!(polish(Some(&p), "hello world"), "Hello World");
         // Pre-punctuated input strips to the same shape first, so the model
@@ -1030,8 +1093,11 @@ mod tests {
             Err(_) => return,
         };
         assert!(asr.is_streaming());
-        let session = asr.streaming_session().expect("streaming backend has a session");
-        let wave = sherpa_onnx::Wave::read(wav.to_str().expect("utf-8 path")).expect("read test wav");
+        let session = asr
+            .streaming_session()
+            .expect("streaming backend has a session");
+        let wave =
+            sherpa_onnx::Wave::read(wav.to_str().expect("utf-8 path")).expect("read test wav");
         let samples = wave.samples().to_vec();
         assert!(samples.len() > 16000, "test wav should be at least 1 s");
 

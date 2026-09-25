@@ -247,6 +247,7 @@ cannot hang `stop()` and strand the final `StateChanged("Idle")`.
 ```sh
 cargo build --release        # release binary at target/release/saytype
 cargo test                   # unit tests (transcript incl. empty-final edge cases + mixed erase/undo order across the commit boundary + erase-boundary no-ops and shortening-final erase survival + position-tracking across a word-replacing final, injector incl. clipboard fallback + deferred-paste pipeline + leading-dash end-of-options typing, audio format conversion + malformed-rate resampling guard, VAD AudioRing + gated real-model Silero detection, ASR model detection + polish + backend fallback + empty/short-input guard + real-model streaming round trip, daemon stable-target logic + toggle debounce + all three typing-mode injector sequences (live and final-only against a faked ydotool, incl. a dead-ydotool failure-resilience pass and Live-mode mid-dictation erase/undo editing the live buffer) + gated real-model streaming and batch pipeline tasks + engine lifecycle (idle no-ops, double-start guard, drain order), CLI --asr value parsing (incl. repeated-flag last-wins) + typing-mode flag parsing + models-dir resolution precedence) + tests/cli.rs binary-level checks (wrong-rate/missing WAV rejected before any model load + CLI exit-code contract: misuse exits 2 incl. a missing/empty --asr value; repeated --asr flags are last-wins, not an error, --help exits 0, empty --paste-test exits 0 headlessly)
+cargo fmt --check            # verify rustfmt-clean (run `cargo fmt` to fix)
 cargo run                    # run the daemon manually (needs models/ + session bus)
 
 scripts/install-user-service.sh   # build + install + enable the user service
@@ -281,6 +282,7 @@ on stop.
 
 - Rust 2021, `anyhow` for error handling, `tracing` for logging
   (`RUST_LOG=saytype=info` in the unit).
+- Code must be rustfmt-clean: run `cargo fmt` before committing; `cargo fmt --check` must exit 0 (default rustfmt, edition 2021, no repo config).
 - Keep the doc comments on non-obvious invariants (several are hard-won; the
   `audio.rs`/`vad.rs`/`daemon.rs` headers explain why things are the way they are).
 - The daemon (systemd unit) and the HUD extension (gnome-extensions) deploy

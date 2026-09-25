@@ -356,10 +356,7 @@ impl Engine {
         let _ = self
             .events
             .send(EngineEvent::StateChanged("Recording".into()));
-        tracing::info!(
-            "dictation session started (backend: {:?})",
-            self.asr.kind()
-        );
+        tracing::info!("dictation session started (backend: {:?})", self.asr.kind());
         Ok(())
     }
 
@@ -376,8 +373,9 @@ impl Engine {
         // method must not block forever on a thread that never observed
         // the stop flag (the one unbounded stage of stop(); every other
         // stage above is timed out).
-        let capture_exited =
-            tokio::time::timeout(Duration::from_secs(5), session.exited_rx).await.is_ok();
+        let capture_exited = tokio::time::timeout(Duration::from_secs(5), session.exited_rx)
+            .await
+            .is_ok();
 
         // Audio gone: the pipeline flushes its trailing utterance and exits.
         session.pipeline.wait().await;
@@ -479,7 +477,11 @@ async fn asr_task(
         if text.trim().is_empty() {
             continue;
         }
-        if out_tx.send(InjectorInput::Asr(AsrOutput::Final(text))).await.is_err() {
+        if out_tx
+            .send(InjectorInput::Asr(AsrOutput::Final(text)))
+            .await
+            .is_err()
+        {
             return;
         }
     }
@@ -529,7 +531,11 @@ async fn stream_task(
             if seg.len() < audio::SAMPLE_RATE as usize / 10 || text.is_empty() {
                 continue;
             }
-            if out_tx.send(InjectorInput::Asr(AsrOutput::Final(text))).await.is_err() {
+            if out_tx
+                .send(InjectorInput::Asr(AsrOutput::Final(text)))
+                .await
+                .is_err()
+            {
                 return;
             }
         }
@@ -562,7 +568,11 @@ async fn stream_task(
             continue;
         }
         tracing::info!("flushed trailing utterance: {:?}", text);
-        if out_tx.send(InjectorInput::Asr(AsrOutput::Final(text))).await.is_err() {
+        if out_tx
+            .send(InjectorInput::Asr(AsrOutput::Final(text)))
+            .await
+            .is_err()
+        {
             return;
         }
     }
@@ -742,7 +752,11 @@ async fn injector_task(
             InjectorInput::Undo => {
                 if transcript.undo_last() {
                     apply_transcript_change(
-                        &mut live, &transcript, &events, typing_mode, "restored",
+                        &mut live,
+                        &transcript,
+                        &events,
+                        typing_mode,
+                        "restored",
                     )
                     .await;
                 }
@@ -948,7 +962,7 @@ mod tests {
         tick(&mut live, &mut t, "the quick brown");
         tick(&mut live, &mut t, "the quick brown");
         assert!(t.erase_last()); // "brown" pending
-        // A new word arrives: "brown" is gone for good.
+                                 // A new word arrives: "brown" is gone for good.
         tick(&mut live, &mut t, "the quick brown fox");
         tick(&mut live, &mut t, "the quick brown fox");
         // The raw stable prefix "the quick brown fox" must not retype
@@ -1025,12 +1039,7 @@ mod tests {
     async fn deferred_injector_task_emits_the_documented_event_sequence() {
         let (out_tx, out_rx) = mpsc::channel::<InjectorInput>(8);
         let (ev_tx, mut ev_rx) = mpsc::unbounded_channel::<EngineEvent>();
-        let handle = tokio::spawn(injector_task(
-            out_rx,
-            ev_tx,
-            TypingMode::Deferred,
-            true,
-        ));
+        let handle = tokio::spawn(injector_task(out_rx, ev_tx, TypingMode::Deferred, true));
 
         out_tx
             .send(InjectorInput::Asr(AsrOutput::Partial("hello world".into())))
@@ -1655,13 +1664,17 @@ mod tests {
         let _env = EnvPatch::new(d, true).await;
 
         let (events_tx, mut events_rx) = mpsc::unbounded_channel::<EngineEvent>();
-        let mut engine =
-            match Engine::load(&models, events_tx, BackendSelection::Moonshine, TypingMode::Deferred)
-                .await
-            {
-                Ok(e) => e,
-                Err(_) => return,
-            };
+        let mut engine = match Engine::load(
+            &models,
+            events_tx,
+            BackendSelection::Moonshine,
+            TypingMode::Deferred,
+        )
+        .await
+        {
+            Ok(e) => e,
+            Err(_) => return,
+        };
 
         // Idle: no session, and every command is a silent no-op.
         assert!(!engine.is_recording());
@@ -1677,10 +1690,7 @@ mod tests {
         engine.start().await.expect("start with loaded models");
         assert!(engine.is_recording());
         let err = engine.start().await.unwrap_err().to_string();
-        assert!(
-            err.contains("already recording"),
-            "unexpected error: {err}"
-        );
+        assert!(err.contains("already recording"), "unexpected error: {err}");
 
         // Stop: the pipeline drains before the final Idle, so over the
         // whole session the state changes are exactly Recording, then Idle
@@ -1742,7 +1752,10 @@ mod double_erase_regression {
         let mut t = Transcript::new();
         tick(&mut live, &mut t, "the quick brown fox");
         tick(&mut live, &mut t, "the quick brown fox");
-        assert_eq!(live.stable_target(&t), Some("The quick brown fox".to_string()));
+        assert_eq!(
+            live.stable_target(&t),
+            Some("The quick brown fox".to_string())
+        );
         assert!(t.erase_last());
         assert!(t.erase_last());
         assert_eq!(t.display(), "the quick");
