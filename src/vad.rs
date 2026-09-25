@@ -30,9 +30,11 @@ pub struct AudioRing {
 }
 
 impl AudioRing {
+    /// `capacity` is clamped to at least 1: a zero-length buffer would make
+    /// the index arithmetic in `push`/`slice` divide by zero and panic.
     pub fn new(capacity: usize) -> Self {
         Self {
-            buf: vec![0.0; capacity],
+            buf: vec![0.0; capacity.max(1)],
             total: 0,
         }
     }
@@ -235,5 +237,95 @@ mod tests {
         // Oldest retained index is total - cap = 200.
         let oldest = ring.slice(200, 201);
         assert_eq!(oldest[0], 200.0);
+    }
+
+    #[test]
+    fn slice_zero_length_and_inverted_ranges_are_empty() {
+        let mut ring = AudioRing::new(100);
+        let data: Vec<f32> = (0..50).map(|i| i as f32).collect();
+        ring.push(&data);
+        assert!(ring.slice(10, 10).is_empty());
+        assert!(ring.slice(30, 10).is_empty());
+    }
+
+    #[test]
+    fn slice_on_unused_ring_zero_fills() {
+        // A fresh ring holds no samples at all: any range is zero-filled.
+        let ring = AudioRing::new(100);
+        let got = ring.slice(0, 10);
+        assert_eq!(got.len(), 10);
+        assert!(got.iter().all(|&v| v == 0.0));
+    }
+
+    #[test]
+    fn slice_entirely_before_capture_is_all_zeros() {
+        let mut ring = AudioRing::new(100);
+        let data: Vec<f32> = (0..50).map(|i| i as f32).collect();
+        ring.push(&data);
+        // Both endpoints before the first sample: nothing is available.
+        let got = ring.slice(-20, -5);
+        assert_eq!(got.len(), 15);
+        assert!(got.iter().all(|&v| v == 0.0));
+    }
+
+    #[test]
+    fn slice_end_exactly_at_total_has_no_tail_padding() {
+        let mut ring = AudioRing::new(100);
+        let data: Vec<f32> = (0..50).map(|i| i as f32).collect();
+        ring.push(&data);
+        // `end == total` is the boundary: the whole range is real audio,
+        // no zero tail (unlike the POST_PAD case, which reaches past it).
+        let got = ring.slice(40, 50);
+        assert_eq!(got.len(), 10);
+        assert_eq!(got[0], 40.0);
+        assert_eq!(got[9], 49.0);
+    }
+
+    #[test]
+    fn slice_start_past_total_is_all_zeros() {
+        let mut ring = AudioRing::new(100);
+        let data: Vec<f32> = (0..50).map(|i| i as f32).collect();
+        ring.push(&data);
+        let got = ring.slice(60, 80);
+        assert_eq!(got.len(), 20);
+        assert!(got.iter().all(|&v| v == 0.0));
+    }
+
+    #[test]
+    fn slice_exact_full_retained_window() {
+        let mut ring = AudioRing::new(100);
+        let data: Vec<f32> = (0..150).map(|i| i as f32).collect();
+        ring.push(&data);
+        // The retained window is exactly indices 50..150: every sample in
+        // the range is real (no zero fill on either side).
+        let got = ring.slice(50, 150);
+        assert_eq!(got.len(), 100);
+        assert_eq!(got[0], 50.0);
+        assert_eq!(got[99], 149.0);
+    }
+
+    #[test]
+    fn push_empty_slice_is_a_noop() {
+        let mut ring = AudioRing::new(100);
+        ring.push(&[]);
+        // Nothing was recorded: the ring still behaves like a fresh one.
+        assert!(ring.slice(0, 10).iter().all(|&v| v == 0.0));
+        ring.push(&[7.0]);
+        assert_eq!(ring.slice(0, 1), vec![7.0]);
+    }
+
+    #[test]
+    fn zero_capacity_ring_stays_safe() {
+        // Degenerate construction must not panic in push/slice; it behaves
+        // like a one-sample ring (only the newest sample is addressable).
+        let mut ring = AudioRing::new(0);
+        ring.push(&[1.0, 2.0, 3.0]);
+        // Only the newest sample (absolute index 2) is retained (oldest
+        // retained index is total - cap = 3 - 1 = 2).
+        assert_eq!(ring.slice(2, 3), vec![3.0]);
+        let got = ring.slice(0, 3);
+        assert_eq!(got[0], 0.0); // index 0 fell out of the 1-sample window
+        assert_eq!(got[1], 0.0); // index 1 fell out too
+        assert_eq!(got[2], 3.0); // the newest sample is retained
     }
 }
