@@ -1140,6 +1140,106 @@ mod tests {
             ]
         );
     }
+
+    /// The FinalOnly-mode (MVP1 behavior) injector task, end to end, against
+    /// a faked `ydotool` on a sandboxed PATH: pins the documented typing
+    /// behavior - partials are *never* typed, even at the exact moment Live
+    /// mode would type them (a partial seen `STABILITY_PARTIALS` times in a
+    /// row), each `Final` is typed immediately as one chunk that extends the
+    /// committed text, a mid-utterance erase/undo leaves the (finals-only)
+    /// buffer untouched while the HUD transcript follows, a committed-word
+    /// erase backspaces exactly that word from the buffer (undo retypes it),
+    /// and - unlike Deferred mode - no one-shot paste happens at session stop.
+    #[tokio::test]
+    async fn final_only_injector_task_types_each_final_immediately_and_never_partials() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
+        let log = d.join("ydotool.log");
+        make_fake_tool(
+            d,
+            "ydotool",
+            &format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> {}\n", log.display()),
+        );
+        let _env = EnvPatch::new(d, true).await;
+
+        let (out_tx, out_rx) = mpsc::channel::<InjectorInput>(8);
+        let (ev_tx, mut ev_rx) = mpsc::unbounded_channel::<EngineEvent>();
+        let handle = tokio::spawn(injector_task(out_rx, ev_tx, TypingMode::FinalOnly, true));
+
+        // Two identical partials: in Live mode the second one crosses the
+        // stability threshold and gets typed; FinalOnly must not type.
+        out_tx
+            .send(InjectorInput::Asr(AsrOutput::Partial("hello".into())))
+            .await
+            .unwrap();
+        out_tx
+            .send(InjectorInput::Asr(AsrOutput::Partial("hello world".into())))
+            .await
+            .unwrap();
+        // The final is typed immediately, one chunk, capitalized.
+        out_tx
+            .send(InjectorInput::Asr(AsrOutput::Final("hello world".into())))
+            .await
+            .unwrap();
+        // Two more identical partials: still nothing typed.
+        out_tx
+            .send(InjectorInput::Asr(AsrOutput::Partial("next thing".into())))
+            .await
+            .unwrap();
+        out_tx
+            .send(InjectorInput::Asr(AsrOutput::Partial("next thing".into())))
+            .await
+            .unwrap();
+        // Erasing the live partial word leaves the (finals-only) buffer
+        // unchanged; the HUD transcript follows both the erase and the undo.
+        out_tx.send(InjectorInput::Erase).await.unwrap();
+        out_tx.send(InjectorInput::Undo).await.unwrap();
+        // The second final extends the buffer by exactly the new chunk
+        // (leading space and all, since the new segment is capitalized).
+        out_tx
+            .send(InjectorInput::Asr(AsrOutput::Final("next thing".into())))
+            .await
+            .unwrap();
+        // A committed-word erase backspaces exactly that word; undo retypes it.
+        out_tx.send(InjectorInput::Erase).await.unwrap();
+        out_tx.send(InjectorInput::Undo).await.unwrap();
+        drop(out_tx);
+        handle.await.unwrap();
+
+        // Exactly four invocations: two final chunks, one backspace
+        // correction, one retype - no partial typing anywhere, and no
+        // `key ctrl+v` paste at stop (FinalOnly never pastes).
+        assert_eq!(
+            std::fs::read_to_string(&log).unwrap(),
+            "type Hello world\ntype  Next thing\nkey --repeat 6 --delay 0 --repeat-delay 0 Backspace\ntype  thing\n"
+        );
+
+        let mut events = Vec::new();
+        while let Ok(ev) = ev_rx.try_recv() {
+            events.push(ev);
+        }
+        assert_eq!(
+            events,
+            vec![
+                EngineEvent::PartialTranscribed("hello".into()),
+                EngineEvent::TranscriptUpdated("hello".into()),
+                EngineEvent::PartialTranscribed("hello world".into()),
+                EngineEvent::TranscriptUpdated("hello world".into()),
+                EngineEvent::SegmentTranscribed("hello world".into()),
+                EngineEvent::TranscriptUpdated("Hello world".into()),
+                EngineEvent::PartialTranscribed("next thing".into()),
+                EngineEvent::TranscriptUpdated("Hello world next thing".into()),
+                EngineEvent::PartialTranscribed("next thing".into()),
+                EngineEvent::TranscriptUpdated("Hello world next thing".into()),
+                EngineEvent::TranscriptUpdated("Hello world next".into()),
+                EngineEvent::TranscriptUpdated("Hello world next thing".into()),
+                EngineEvent::SegmentTranscribed("next thing".into()),
+                EngineEvent::TranscriptUpdated("Hello world Next thing".into()),
+                EngineEvent::TranscriptUpdated("Hello world Next".into()),
+                EngineEvent::TranscriptUpdated("Hello world Next thing".into()),
+            ]
+        );
+    }
 }
 
 #[cfg(test)]
