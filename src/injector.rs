@@ -261,6 +261,7 @@ pub fn capitalize_first(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testutil::{make_fake_tool, EnvPatch};
 
     #[test]
     fn capitalizes_first_char() {
@@ -351,29 +352,9 @@ mod tests {
         assert!(backspaces(0).await.is_ok());
     }
 
-    /// Serializes the subprocess-based clipboard tests. Each fake tool is a
-    /// `#!/bin/sh` script, and concurrent execs of the same shared
-    /// interpreter can race in the kernel's exec write-count bookkeeping
-    /// (observed ETXTBSY from `spawn` under the full parallel suite), so
-    /// these tests must not overlap their tool spawns.
-    static CLIPBOARD_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
-    /// Write an executable fake clipboard tool to a temp dir and return its
-    /// absolute path (commands are looked up by exact path, so no PATH or
-    /// env mutation is needed - safe under parallel tests).
-    fn make_fake_tool(dir: &std::path::Path, name: &str, body: &str) -> String {
-        use std::os::unix::fs::PermissionsExt;
-        let path = dir.join(name);
-        std::fs::write(&path, body).unwrap();
-        let mut perms = std::fs::metadata(&path).unwrap().permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&path, perms).unwrap();
-        path.to_str().unwrap().to_string()
-    }
-
     #[tokio::test]
     async fn clipboard_tool_receives_stdin_and_success_wins() {
-        let _guard = CLIPBOARD_TEST_LOCK.lock().await;
+        let _guard = crate::testutil::TOOL_SPAWN_LOCK.lock().await;
         let tmp = tempfile::tempdir().unwrap();
         let out = tmp.path().join("got.txt");
         let tool = make_fake_tool(tmp.path(), "tool", &format!("#!/bin/sh\ncat > {}\n", out.display()));
@@ -383,7 +364,7 @@ mod tests {
 
     #[tokio::test]
     async fn clipboard_tool_failure_reports_stderr() {
-        let _guard = CLIPBOARD_TEST_LOCK.lock().await;
+        let _guard = crate::testutil::TOOL_SPAWN_LOCK.lock().await;
         let tmp = tempfile::tempdir().unwrap();
         let tool = make_fake_tool(tmp.path(), "tool", "#!/bin/sh\necho boom >&2\nexit 1\n");
         let err = try_clipboard_tools("x", &[(tool.as_str(), &[])]).await.unwrap_err();
@@ -392,7 +373,7 @@ mod tests {
 
     #[tokio::test]
     async fn clipboard_missing_tool_is_an_error() {
-        let _guard = CLIPBOARD_TEST_LOCK.lock().await;
+        let _guard = crate::testutil::TOOL_SPAWN_LOCK.lock().await;
         // A nonexistent command fails at spawn time, before any timeout.
         let err = try_clipboard_tools("x", &[("/nonexistent/clipboard-tool-xyz", &[])]).await.unwrap_err();
         assert!(matches!(err.kind(), io::ErrorKind::NotFound), "{err}");
@@ -400,7 +381,7 @@ mod tests {
 
     #[tokio::test]
     async fn clipboard_backgrounding_is_treated_as_success() {
-        let _guard = CLIPBOARD_TEST_LOCK.lock().await;
+        let _guard = crate::testutil::TOOL_SPAWN_LOCK.lock().await;
         // xclip forks into the background to keep serving the selection: a
         // tool still running after the detach grace period must count as
         // success, and we must not wait for it to actually exit (2 s here).
@@ -414,7 +395,7 @@ mod tests {
 
     #[tokio::test]
     async fn clipboard_falls_back_to_second_tool() {
-        let _guard = CLIPBOARD_TEST_LOCK.lock().await;
+        let _guard = crate::testutil::TOOL_SPAWN_LOCK.lock().await;
         let tmp = tempfile::tempdir().unwrap();
         let bad = make_fake_tool(tmp.path(), "bad", "#!/bin/sh\nexit 1\n");
         let good = make_fake_tool(tmp.path(), "good", "#!/bin/sh\ncat >/dev/null\n");
@@ -423,7 +404,7 @@ mod tests {
 
     #[tokio::test]
     async fn clipboard_all_tools_fail_returns_last_error() {
-        let _guard = CLIPBOARD_TEST_LOCK.lock().await;
+        let _guard = crate::testutil::TOOL_SPAWN_LOCK.lock().await;
         let tmp = tempfile::tempdir().unwrap();
         let first = make_fake_tool(tmp.path(), "first", "#!/bin/sh\necho first-fail >&2\nexit 1\n");
         let second = make_fake_tool(tmp.path(), "second", "#!/bin/sh\necho second-fail >&2\nexit 1\n");
@@ -434,50 +415,6 @@ mod tests {
         .await
         .unwrap_err();
         assert!(err.to_string().contains("second-fail"), "{err}");
-    }
-
-    /// Serializes the tests that temporarily rewrite process-global env
-    /// (PATH / WAYLAND_DISPLAY). They must not overlap each other; the
-    /// absolute-path clipboard tests above are unaffected, because no other
-    /// test spawns a bare command name, so a sandboxed PATH cannot leak
-    /// into them.
-    static PASTE_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
-    /// Temporarily put `dir` first on PATH (process-global) and set or
-    /// clear WAYLAND_DISPLAY; both are restored on drop. Prepending (not
-    /// replacing) keeps the fake tools' own `cat` resolvable, while any
-    /// bare name the paste pipeline spawns still resolves to the fake in
-    /// `dir` first, regardless of what the machine has installed.
-    struct EnvPatch {
-        old_path: String,
-        old_wayland: Option<std::ffi::OsString>,
-    }
-
-    impl EnvPatch {
-        fn new(dir: &std::path::Path, wayland: bool) -> Self {
-            let old_path = std::env::var("PATH").unwrap_or_default();
-            let old_wayland = std::env::var_os("WAYLAND_DISPLAY");
-            std::env::set_var(
-                "PATH",
-                format!("{}:{}", dir.display(), old_path),
-            );
-            if wayland {
-                std::env::set_var("WAYLAND_DISPLAY", "wayland-0");
-            } else {
-                std::env::remove_var("WAYLAND_DISPLAY");
-            }
-            Self { old_path, old_wayland }
-        }
-    }
-
-    impl Drop for EnvPatch {
-        fn drop(&mut self) {
-            std::env::set_var("PATH", self.old_path.clone());
-            match &self.old_wayland {
-                Some(v) => std::env::set_var("WAYLAND_DISPLAY", v),
-                None => std::env::remove_var("WAYLAND_DISPLAY"),
-            }
-        }
     }
 
     #[test]
@@ -500,7 +437,6 @@ mod tests {
     /// `ydotool key ctrl+v` is sent.
     #[tokio::test]
     async fn paste_text_copies_via_wl_copy_then_pastes_under_wayland() {
-        let _guard = PASTE_TEST_LOCK.lock().await;
         let tmp = tempfile::tempdir().unwrap();
         let d = tmp.path();
         make_fake_tool(d, "wl-copy", &format!("#!/bin/sh\ncat > {}\n", d.join("wl-copy.log").display()));
@@ -510,7 +446,7 @@ mod tests {
             &format!("#!/bin/sh\nprintf '%s ' \"$@\" > {}\ncat > {}\n", d.join("xclip.args").display(), d.join("xclip.log").display()),
         );
         make_fake_tool(d, "ydotool", &format!("#!/bin/sh\nprintf '%s\\n' \"$@\" > {}\n", d.join("ydotool.log").display()));
-        let _env = EnvPatch::new(d, true);
+        let _env = EnvPatch::new(d, true).await;
         paste_text("hello world").await.unwrap();
         assert_eq!(std::fs::read_to_string(d.join("wl-copy.log")).unwrap(), "hello world");
         assert!(!d.join("xclip.log").exists());
@@ -523,7 +459,6 @@ mod tests {
     /// fallback.
     #[tokio::test]
     async fn paste_text_prefers_xclip_under_x11_and_passes_selection_arg() {
-        let _guard = PASTE_TEST_LOCK.lock().await;
         let tmp = tempfile::tempdir().unwrap();
         let d = tmp.path();
         make_fake_tool(d, "wl-copy", &format!("#!/bin/sh\ncat > {}\n", d.join("wl-copy.log").display()));
@@ -533,7 +468,7 @@ mod tests {
             &format!("#!/bin/sh\nprintf '%s ' \"$@\" > {}\ncat > {}\n", d.join("xclip.args").display(), d.join("xclip.log").display()),
         );
         make_fake_tool(d, "ydotool", &format!("#!/bin/sh\nprintf '%s\\n' \"$@\" > {}\n", d.join("ydotool.log").display()));
-        let _env = EnvPatch::new(d, false);
+        let _env = EnvPatch::new(d, false).await;
         paste_text("hi there").await.unwrap();
         assert_eq!(std::fs::read_to_string(d.join("xclip.log")).unwrap(), "hi there");
         assert_eq!(std::fs::read_to_string(d.join("xclip.args")).unwrap(), "-selection clipboard ");
@@ -546,13 +481,12 @@ mod tests {
     /// whatever stale text the clipboard already held.
     #[tokio::test]
     async fn paste_text_does_not_send_paste_keystroke_when_clipboard_fails() {
-        let _guard = PASTE_TEST_LOCK.lock().await;
         let tmp = tempfile::tempdir().unwrap();
         let d = tmp.path();
         make_fake_tool(d, "wl-copy", "#!/bin/sh\necho clip-fail >&2\nexit 1\n");
         make_fake_tool(d, "xclip", "#!/bin/sh\necho xclip-fail >&2\nexit 1\n");
         make_fake_tool(d, "ydotool", &format!("#!/bin/sh\nprintf '%s\\n' \"$@\" > {}\n", d.join("ydotool.log").display()));
-        let _env = EnvPatch::new(d, true);
+        let _env = EnvPatch::new(d, true).await;
         // Both attempts fail: the error is the last one tried (xclip).
         let err = paste_text("x").await.unwrap_err();
         assert!(err.to_string().contains("xclip-fail"), "{err}");

@@ -839,6 +839,7 @@ pub async fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testutil::{make_fake_tool, EnvPatch};
 
     /// Push the same partial into both the transcript and the stability
     /// buffer, as the injector does on each tick.
@@ -1050,6 +1051,92 @@ mod tests {
                 EngineEvent::TranscriptUpdated("Hello world".into()),
                 EngineEvent::TranscriptUpdated("Hello".into()),
                 EngineEvent::TranscriptUpdated(String::new()),
+            ]
+        );
+    }
+
+    /// The Live-mode (old mvp2 default) injector task, end to end, against a
+    /// faked `ydotool` on a sandboxed PATH: pins the documented typing
+    /// behavior - nothing is typed until a partial has survived
+    /// `STABILITY_PARTIALS` consecutive ticks, the stable prefix is typed
+    /// (capitalized, first segment) and extended as it grows, a decoder
+    /// revision that shortens the stable prefix is corrected with exactly
+    /// that many backspaces, the final converges the buffer to the
+    /// committed text, and - unlike Deferred mode - no one-shot paste
+    /// happens at session stop.
+    #[tokio::test]
+    async fn live_injector_task_types_stable_prefix_corrects_tail_and_converges_on_final() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
+        let log = d.join("ydotool.log");
+        // The fake ydotool records each invocation (space-joined args) as
+        // one line; the injector task serializes its calls and awaits each
+        // one, so the lines appear in exactly the order they were sent.
+        make_fake_tool(
+            d,
+            "ydotool",
+            &format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> {}\n", log.display()),
+        );
+        let _env = EnvPatch::new(d, true).await;
+
+        let (out_tx, out_rx) = mpsc::channel::<InjectorInput>(8);
+        let (ev_tx, mut ev_rx) = mpsc::unbounded_channel::<EngineEvent>();
+        let handle = tokio::spawn(injector_task(out_rx, ev_tx, TypingMode::Live, true));
+
+        // 1: single partial - below the stability threshold, nothing typed.
+        out_tx
+            .send(InjectorInput::Asr(AsrOutput::Partial("hello wo".into())))
+            .await
+            .unwrap();
+        // 2: stable prefix "hello wo" across the last two partials -> type it.
+        out_tx
+            .send(InjectorInput::Asr(AsrOutput::Partial("hello world".into())))
+            .await
+            .unwrap();
+        // 3: stable prefix grows to "hello world" -> extend, no backspaces.
+        out_tx
+            .send(InjectorInput::Asr(AsrOutput::Partial("hello world".into())))
+            .await
+            .unwrap();
+        // 4: decoder revises the tail ("world" -> "worx"): the stable prefix
+        //    shrinks to "hello wor" -> exactly two backspaces, nothing typed.
+        out_tx
+            .send(InjectorInput::Asr(AsrOutput::Partial("hello worx".into())))
+            .await
+            .unwrap();
+        // 5: the final converges the buffer to the committed text.
+        out_tx
+            .send(InjectorInput::Asr(AsrOutput::Final("hello world.".into())))
+            .await
+            .unwrap();
+        drop(out_tx);
+        handle.await.unwrap();
+
+        // Exactly four ydotool invocations: no pre-stability typing, one
+        // extension, one backspace correction, one final convergence - and
+        // no `key ctrl+v` paste at stop (Live mode never pastes).
+        assert_eq!(
+            std::fs::read_to_string(&log).unwrap(),
+            "type Hello wo\ntype rld\nkey --repeat 2 --delay 0 --repeat-delay 0 Backspace\ntype ld.\n"
+        );
+
+        let mut events = Vec::new();
+        while let Ok(ev) = ev_rx.try_recv() {
+            events.push(ev);
+        }
+        assert_eq!(
+            events,
+            vec![
+                EngineEvent::PartialTranscribed("hello wo".into()),
+                EngineEvent::TranscriptUpdated("hello wo".into()),
+                EngineEvent::PartialTranscribed("hello world".into()),
+                EngineEvent::TranscriptUpdated("hello world".into()),
+                EngineEvent::PartialTranscribed("hello world".into()),
+                EngineEvent::TranscriptUpdated("hello world".into()),
+                EngineEvent::PartialTranscribed("hello worx".into()),
+                EngineEvent::TranscriptUpdated("hello worx".into()),
+                EngineEvent::SegmentTranscribed("hello world.".into()),
+                EngineEvent::TranscriptUpdated("Hello world.".into()),
             ]
         );
     }

@@ -5,6 +5,9 @@ mod injector;
 mod transcript;
 mod vad;
 
+#[cfg(test)]
+mod testutil;
+
 use std::path::PathBuf;
 
 use anyhow::Context;
