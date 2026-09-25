@@ -539,6 +539,34 @@ mod tests {
         assert!(!t.undo_last());
     }
 
+    /// The position-based tracking contract across a final: a partial
+    /// erasure records the token *position*, not the word. When the final
+    /// (same length as the partial's high-water mark: no new content, so no
+    /// flush) replaces the erased position with a different word, the
+    /// erasure follows the position - the replacement word is the hidden
+    /// one - and undo restores *that* word. (Contrast with
+    /// `final_shorter_than_partial_drops_dangling_erasure`, where the final
+    /// has no token at the position at all and the erasure is dropped.)
+    #[test]
+    fn erased_partial_position_tracks_a_replacing_final_word() {
+        let mut t = Transcript::new();
+        t.feed_partial("alpha beta");
+        assert!(t.erase_last()); // "beta" (position 1) pending
+        assert_eq!(t.display(), "alpha");
+        // The decoder's final revises position 1 to a wholly different
+        // word; the utterance length is unchanged (2 tokens, the
+        // high-water mark), so the pending erasure converts, not flushes.
+        t.feed_final("gamma delta");
+        // The replacement word "delta" is what the erasure now hides.
+        assert_eq!(t.display(), "Gamma");
+        // Undo restores the replacement word at its original position.
+        assert!(t.undo_last());
+        assert_eq!(t.display(), "Gamma delta");
+        assert!(!t.undo_last());
+        // The typed buffer follows the same conversion.
+        assert_eq!(t.buffer_target(""), "Gamma delta");
+    }
+
     #[test]
     fn undo_of_a_decoder_dropped_partial_word_is_visible_noop() {
         let mut t = Transcript::new();
