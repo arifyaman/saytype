@@ -46,23 +46,28 @@ impl std::error::Error for CorruptModel {}
 /// structurally valid protobuf but semantically broken ONNX is *not*
 /// caught; that is far rarer and would need a full ONNX parser.
 ///
-/// `Ok(false)` means "structurally not an ONNX file" (garbage, or
-/// truncated at any point - the interrupted-download case); `Err` means
-/// the file could not be read at all (I/O failure).
+/// `Ok(false)` means "structurally not an ONNX file" (garbage, truncated
+/// at any point, or malformed - the interrupted-download case); `Err`
+/// means the file could not be read at all (I/O failure).
 pub fn is_plausible_onnx<R: Read>(r: R) -> io::Result<bool> {
     match walk(r) {
         Ok(v) => Ok(v),
         // Truncation anywhere (an interrupted download) is "not an ONNX
         // file", not an I/O failure.
         Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => Ok(false),
+        // A varint over our 5-byte cap is malformed protobuf (no real ONNX
+        // top-level field does this): also "not an ONNX file", so the
+        // caller gets the re-download message rather than a raw I/O error.
+        Err(e) if e.kind() == io::ErrorKind::InvalidData => Ok(false),
         Err(e) => Err(e),
     }
 }
 
 /// The actual envelope walk: `Ok(true)` when the top-level protobuf fields
 /// walk to a clean end of file, `Ok(false)` when the structure is simply
-/// wrong, `Err(UnexpectedEof)` when the file ends in the middle of a
-/// field (truncation).
+/// wrong, `Err(UnexpectedEof)` when the file ends in the middle of a field
+/// (truncation), and `Err(InvalidData)` when a varint exceeds the 5-byte
+/// cap (malformed - `is_plausible_onnx` folds that into `Ok(false)`).
 fn walk<R: Read>(mut r: R) -> io::Result<bool> {
     let first = read_byte(&mut r)?;
     if first != Some(0x08) {
@@ -117,8 +122,9 @@ fn read_byte(r: &mut impl Read) -> io::Result<Option<u8>> {
 }
 
 /// A base-128 varint of at most 5 bytes (a 6th byte is malformed for our
-/// purposes). `Ok(None)` at a clean end of file before any byte; `Err` if
-/// the file ends mid-varint.
+/// purposes). `Ok(None)` at a clean end of file before any byte;
+/// `Err(UnexpectedEof)` if the file ends mid-varint; `Err(InvalidData)`
+/// if the varint runs past 5 bytes.
 fn read_varint(r: &mut impl Read) -> io::Result<Option<usize>> {
     let mut result: usize = 0;
     for shift in (0..35).step_by(7) {
@@ -242,6 +248,31 @@ mod tests {
         // Field 1 again with wire type 3 (group start): reserved.
         let v = [0x08, 0x03, 0x0B, 0x01];
         assert!(!is_plausible_onnx(&v[..]).unwrap());
+    }
+
+    #[test]
+    fn multi_byte_varint_tag_and_value_accepted() {
+        // A top-level field number >= 16 encodes its tag as a multi-byte
+        // varint (field 16, wire type 0 -> tag bytes 0x80 0x01); real
+        // protobuf messages use these, so the envelope must accept them.
+        let tag = [0x08, 0x03, 0x80, 0x01, 0x01];
+        assert!(is_plausible_onnx(&tag[..]).unwrap());
+        // A multi-byte varint *value* (ir_version = 300 = 0xAC 0x02) too.
+        let value = [0x08, 0xAC, 0x02, 0x18, 0x05];
+        assert!(is_plausible_onnx(&value[..]).unwrap());
+        // A multi-byte tag on a length-delimited field (field 16, wire 2).
+        let tag_len = [0x08, 0x03, 0x82, 0x01, 0x02, b'x', b'y'];
+        assert!(is_plausible_onnx(&tag_len[..]).unwrap());
+    }
+
+    #[test]
+    fn over_long_varint_is_not_onnx_not_io_error() {
+        // A varint whose first 5 bytes all carry the continuation bit never
+        // terminates within the 5-byte cap: malformed protobuf, classified
+        // as "not an ONNX file" (Ok(false)) rather than an I/O error, so
+        // check_onnx_file yields the re-download hint.
+        let malformed = [0x08, 0x80, 0x80, 0x80, 0x80, 0x80, 0x01];
+        assert!(!is_plausible_onnx(&malformed[..]).unwrap());
     }
 
     #[test]
