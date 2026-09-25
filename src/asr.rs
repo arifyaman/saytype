@@ -672,6 +672,14 @@ mod tests {
             .unwrap_or_default()
     }
 
+    /// The repo's `models/` directory, or None when it is absent (e.g. a
+    /// fresh clone before `scripts/download-models.sh`) - the real-model
+    /// tests skip silently in that case.
+    fn repo_models_dir() -> Option<PathBuf> {
+        let p = Path::new(env!("CARGO_MANIFEST_DIR")).join("models");
+        p.is_dir().then_some(p)
+    }
+
     #[test]
     fn polish_without_punct_model_normalizes() {
         // Empty and whitespace-only input.
@@ -923,6 +931,111 @@ mod tests {
             .expect("error expected")
             .to_string();
         assert!(err.contains("no Moonshine model found"), "unexpected error: {err}");
+    }
+
+    /// Serializes the real-model tests: a Nemotron encoder alone is
+    /// ~623 MB and each loaded model keeps its ONNX allocations alive for
+    /// the whole test, so loading several of them in parallel (the harness
+    /// runs up to one test per CPU) is wasteful and, on a loaded box, slow.
+    static MODEL_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Lock the real-model serialization mutex. Recovers from poisoning so
+    /// one test panicking cannot strand the others.
+    fn model_lock() -> std::sync::MutexGuard<'static, ()> {
+        MODEL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// `polish` with a real online-punctuation model (skipped when the
+    /// model dir is absent). Pins the model's deterministic output policy
+    /// and - the regression this test exists for - that pre-punctuated
+    /// input cannot double-mark: the strip step runs before the model, so
+    /// "HELLO, WORLD!" polishes to exactly what "hello world" does.
+    #[test]
+    fn polish_with_real_punct_model_restores_casing() {
+        let _lock = model_lock();
+        let Some(models) = repo_models_dir() else {
+            return;
+        };
+        let Some(p) = Asr::create_punct(&models, 1) else {
+            return;
+        };
+        // The model capitalizes sentence starts (its capitalization is a
+        // learned behavior, not a regex: it may also cap some other words).
+        assert_eq!(polish(Some(&p), "hello world"), "Hello World");
+        assert_eq!(polish(Some(&p), "the quick brown fox"), "The quick brown fox");
+        // Deterministic across calls.
+        assert_eq!(polish(Some(&p), "hello world"), "Hello World");
+        // Pre-punctuated input strips to the same shape first, so the model
+        // never sees the marks and cannot double them.
+        assert_eq!(
+            polish(Some(&p), "HELLO, WORLD!"),
+            polish(Some(&p), "hello world")
+        );
+    }
+
+    /// Full `StreamingSession` round trip on a real model + real speech
+    /// (skipped when the repo's `models/` dir is absent): feed a 16 kHz
+    /// utterance in 512-sample chunks like the live pipeline, watch live
+    /// partials appear, commit at an utterance boundary, and verify the
+    /// reset leaves a clean stream that serves a second utterance.
+    #[test]
+    fn streaming_session_roundtrip_with_real_model() {
+        let _lock = model_lock();
+        let Some(models) = repo_models_dir() else {
+            return;
+        };
+        // Use the test WAV shipped with whichever streaming model dir is
+        // installed (both carry the same "After early nightfall..." file).
+        let wav = if let Some(p) = Asr::find_nemotron(&models) {
+            p.dir.join("test_wavs/0.wav")
+        } else if let Ok(p) = Asr::resolve_zipformer_paths(&models) {
+            p.dir.join("test_wavs/0.wav")
+        } else {
+            return;
+        };
+        if !wav.is_file() {
+            return;
+        }
+        let asr = match Asr::new(&models, 2, BackendSelection::Streaming) {
+            Ok(a) => a,
+            Err(_) => return,
+        };
+        assert!(asr.is_streaming());
+        let session = asr.streaming_session().expect("streaming backend has a session");
+        let wave = sherpa_onnx::Wave::read(wav.to_str().expect("utf-8 path")).expect("read test wav");
+        let samples = wave.samples().to_vec();
+        assert!(samples.len() > 16000, "test wav should be at least 1 s");
+
+        // Feed in 512-sample chunks (32 ms, the VAD window size) and track
+        // that live partials appear before the commit.
+        let mut saw_partial = false;
+        for chunk in samples.chunks(512) {
+            session.feed(chunk);
+            if !session.partial().is_empty() {
+                saw_partial = true;
+            }
+        }
+        assert!(saw_partial, "no live partial was produced while feeding");
+
+        let final_text = session.commit();
+        assert!(
+            final_text.to_lowercase().contains("yellow lamps"),
+            "unexpected final: {final_text:?}"
+        );
+
+        // Commit resets the stream: committing again with no new audio
+        // yields no text.
+        assert_eq!(session.commit(), "", "stream must be clean after commit");
+
+        // The same session serves the next utterance.
+        for chunk in samples.chunks(512) {
+            session.feed(chunk);
+        }
+        let final_text2 = session.commit();
+        assert!(
+            final_text2.to_lowercase().contains("yellow lamps"),
+            "unexpected second final: {final_text2:?}"
+        );
     }
 
     #[test]
