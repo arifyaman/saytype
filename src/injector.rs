@@ -110,6 +110,13 @@ async fn copy_to_clipboard(text: &str) -> io::Result<()> {
     } else {
         [("xclip", &["-selection", "clipboard"]), ("wl-copy", &[])]
     };
+    try_clipboard_tools(text, &attempts).await
+}
+
+/// Pipe `text` into each `(command, args)` in order; the first tool that
+/// succeeds wins, and when every attempt fails the last error is returned
+/// (the empty-attempts list reports "no tool available").
+async fn try_clipboard_tools(text: &str, attempts: &[(&str, &[&str])]) -> io::Result<()> {
     let mut last_err = None;
     for (cmd, args) in attempts {
         match with_timeout(cmd, run_with_stdin(cmd, args, text)).await {
@@ -129,7 +136,15 @@ async fn run_with_stdin(cmd: &str, args: &[&str], input: &str) -> io::Result<()>
         .stderr(std::process::Stdio::piped())
         .spawn()?;
     if let Some(mut stdin) = child.stdin.take() {
-        stdin.write_all(input.as_bytes()).await?;
+        // A broken pipe here means the tool exited before reading all of
+        // stdin (a fast failure: bad args, no display, ...) - its exit
+        // status and stderr below carry the real reason, so the write error
+        // must not mask them. Any other write error is propagated.
+        if let Err(e) = stdin.write_all(input.as_bytes()).await {
+            if e.kind() != io::ErrorKind::BrokenPipe {
+                return Err(e);
+            }
+        }
         // Dropping `stdin` here (end of scope) closes the pipe, which is
         // what tells xclip it has read the whole input.
     }
@@ -327,5 +342,90 @@ mod tests {
     async fn zero_backspaces_is_a_noop() {
         // Zero backspaces must not spawn ydotool at all.
         assert!(backspaces(0).await.is_ok());
+    }
+
+    /// Serializes the subprocess-based clipboard tests. Each fake tool is a
+    /// `#!/bin/sh` script, and concurrent execs of the same shared
+    /// interpreter can race in the kernel's exec write-count bookkeeping
+    /// (observed ETXTBSY from `spawn` under the full parallel suite), so
+    /// these tests must not overlap their tool spawns.
+    static CLIPBOARD_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// Write an executable fake clipboard tool to a temp dir and return its
+    /// absolute path (commands are looked up by exact path, so no PATH or
+    /// env mutation is needed - safe under parallel tests).
+    fn make_fake_tool(dir: &std::path::Path, name: &str, body: &str) -> String {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join(name);
+        std::fs::write(&path, body).unwrap();
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&path, perms).unwrap();
+        path.to_str().unwrap().to_string()
+    }
+
+    #[tokio::test]
+    async fn clipboard_tool_receives_stdin_and_success_wins() {
+        let _guard = CLIPBOARD_TEST_LOCK.lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let out = tmp.path().join("got.txt");
+        let tool = make_fake_tool(tmp.path(), "tool", &format!("#!/bin/sh\ncat > {}\n", out.display()));
+        try_clipboard_tools("hello clipboard", &[(tool.as_str(), &[])]).await.unwrap();
+        assert_eq!(std::fs::read_to_string(&out).unwrap(), "hello clipboard");
+    }
+
+    #[tokio::test]
+    async fn clipboard_tool_failure_reports_stderr() {
+        let _guard = CLIPBOARD_TEST_LOCK.lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let tool = make_fake_tool(tmp.path(), "tool", "#!/bin/sh\necho boom >&2\nexit 1\n");
+        let err = try_clipboard_tools("x", &[(tool.as_str(), &[])]).await.unwrap_err();
+        assert!(err.to_string().contains("boom"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn clipboard_missing_tool_is_an_error() {
+        let _guard = CLIPBOARD_TEST_LOCK.lock().await;
+        // A nonexistent command fails at spawn time, before any timeout.
+        let err = try_clipboard_tools("x", &[("/nonexistent/clipboard-tool-xyz", &[])]).await.unwrap_err();
+        assert!(matches!(err.kind(), io::ErrorKind::NotFound), "{err}");
+    }
+
+    #[tokio::test]
+    async fn clipboard_backgrounding_is_treated_as_success() {
+        let _guard = CLIPBOARD_TEST_LOCK.lock().await;
+        // xclip forks into the background to keep serving the selection: a
+        // tool still running after the detach grace period must count as
+        // success, and we must not wait for it to actually exit (2 s here).
+        let tmp = tempfile::tempdir().unwrap();
+        let tool = make_fake_tool(tmp.path(), "tool", "#!/bin/sh\nsleep 2\n");
+        let start = std::time::Instant::now();
+        try_clipboard_tools("x", &[(tool.as_str(), &[])]).await.unwrap();
+        let elapsed = start.elapsed();
+        assert!(elapsed < Duration::from_secs(1), "took {elapsed:?}");
+    }
+
+    #[tokio::test]
+    async fn clipboard_falls_back_to_second_tool() {
+        let _guard = CLIPBOARD_TEST_LOCK.lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let bad = make_fake_tool(tmp.path(), "bad", "#!/bin/sh\nexit 1\n");
+        let good = make_fake_tool(tmp.path(), "good", "#!/bin/sh\ncat >/dev/null\n");
+        try_clipboard_tools("x", &[(bad.as_str(), &[]), (good.as_str(), &[])]).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn clipboard_all_tools_fail_returns_last_error() {
+        let _guard = CLIPBOARD_TEST_LOCK.lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let first = make_fake_tool(tmp.path(), "first", "#!/bin/sh\necho first-fail >&2\nexit 1\n");
+        let second = make_fake_tool(tmp.path(), "second", "#!/bin/sh\necho second-fail >&2\nexit 1\n");
+        let err = try_clipboard_tools(
+            "x",
+            &[(first.as_str(), &[]), (second.as_str(), &[])],
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("second-fail"), "{err}");
     }
 }
