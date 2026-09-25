@@ -152,6 +152,32 @@ fn invalid_asr_value_exits_2_before_any_wav_or_model_work() {
 }
 
 #[test]
+fn asr_flag_missing_or_empty_value_exits_2() {
+    // A dangling `--asr` (no following value) and an explicitly empty value
+    // are both malformed: they exit 2 with the value diagnostic, on the same
+    // path as an invalid value, before any WAV/model work.
+    for args in [
+        &["--transcribe", "--asr"][..],
+        &["--transcribe", "--asr", ""][..],
+    ] {
+        let (code, _stdout, stderr) = run_args(args);
+        assert_eq!(
+            code,
+            Some(2),
+            "a missing/empty --asr value must exit 2: {stderr}"
+        );
+        assert!(
+            stderr.contains("--asr expects auto, streaming, zipformer, or moonshine"),
+            "expected the value diagnostic, got: {stderr}"
+        );
+        assert!(
+            !stderr.contains("cannot read WAV"),
+            "the --asr check must run before the WAV check: {stderr}"
+        );
+    }
+}
+
+#[test]
 fn paste_test_with_empty_text_exits_0_without_any_subprocess() {
     // paste_text("") early-returns before spawning any clipboard/paste tool,
     // so this is the one offline check whose success path needs neither a
