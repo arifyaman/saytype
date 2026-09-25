@@ -46,7 +46,7 @@ Each dictation session runs a pipeline inside the `saytype` daemon:
 - GNOME 46 (developed and tested on Ubuntu 24.04, X11 or Wayland)
 - A microphone set as the default audio input (check with `wpctl status`)
 - `ydotool` + `ydotoold` (installed by `scripts/setup-ydotool.sh`)
-- Models in `models/` (downloaded by `scripts/download-models.sh`)
+- Models in `models/` (downloaded by `scripts/download-models.sh`); the location can be overridden with the `SAYTYPE_MODELS_DIR` environment variable
 
 ## Install
 
@@ -111,7 +111,7 @@ Canary, SenseVoice, ...) are not picked up today.
 
 ```sh
 cargo build --release        # binary at target/release/saytype
-cargo test                   # unit tests (transcript incl. empty-final edge cases + mixed erase/undo order across the commit boundary, injector incl. clipboard fallback + deferred-paste pipeline + leading-dash end-of-options typing, audio format conversion, VAD AudioRing + gated real-model Silero detection, ASR model detection + polish + backend fallback + empty/short-input guard + real-model streaming round trip, daemon stable-target logic + toggle debounce + all three typing-mode injector sequences (live and final-only against a faked ydotool, incl. a dead-ydotool failure-resilience pass) + gated real-model streaming and batch pipeline tasks + engine lifecycle (idle no-ops, double-start guard, drain order), CLI --asr value + typing-mode flag parsing, config)
+cargo test                   # unit tests (transcript incl. empty-final edge cases + mixed erase/undo order across the commit boundary, injector incl. clipboard fallback + deferred-paste pipeline + leading-dash end-of-options typing, audio format conversion, VAD AudioRing + gated real-model Silero detection, ASR model detection + polish + backend fallback + empty/short-input guard + real-model streaming round trip, daemon stable-target logic + toggle debounce + all three typing-mode injector sequences (live and final-only against a faked ydotool, incl. a dead-ydotool failure-resilience pass) + gated real-model streaming and batch pipeline tasks + engine lifecycle (idle no-ops, double-start guard, drain order), CLI --asr value + typing-mode flag parsing + models-dir resolution precedence)
 cargo run                    # run the daemon manually (needs models/ + session bus)
 journalctl --user -u saytype -f
 gdbus monitor --session --dest io.saytype.Dictate --object-path /io/saytype/Dictate

@@ -13,21 +13,37 @@ use std::path::PathBuf;
 use anyhow::Context;
 
 fn models_dir() -> PathBuf {
+    // Documented override: point at a models dir outside the CWD/exe search
+    // (e.g. a shared model cache used by several saytype installs).
     if let Ok(env) = std::env::var("SAYTYPE_MODELS_DIR") {
         return PathBuf::from(env);
     }
-    if let Ok(cwd) = std::env::current_dir() {
-        let p = cwd.join("models");
+    let cwd = std::env::current_dir().ok();
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|p| p.to_path_buf()));
+    resolve_models_dir(cwd, exe_dir)
+}
+
+/// Decide where to look for models given the current working directory and
+/// the directory containing the executable: a `models` dir in the CWD wins
+/// over one next to the executable (running from a repo checkout must use
+/// the repo's models even if an installed binary sits elsewhere), and with
+/// neither present the literal relative path `models` is returned (resolved
+/// against the CWD by the callers, erroring naturally if absent). Kept pure
+/// (paths passed in, no env access) so the precedence contract is
+/// unit-testable without mutating process-global CWD/exe state.
+fn resolve_models_dir(cwd: Option<PathBuf>, exe_dir: Option<PathBuf>) -> PathBuf {
+    if let Some(dir) = cwd {
+        let p = dir.join("models");
         if p.is_dir() {
             return p;
         }
     }
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(parent) = exe.parent() {
-            let p = parent.join("models");
-            if p.is_dir() {
-                return p;
-            }
+    if let Some(dir) = exe_dir {
+        let p = dir.join("models");
+        if p.is_dir() {
+            return p;
         }
     }
     PathBuf::from("models")
@@ -422,6 +438,51 @@ mod typing_mode_tests {
     fn no_live_typing_flag_selects_final_only() {
         let args: Vec<String> = vec!["--no-live-typing".to_string()];
         assert_eq!(parse_typing_mode(&args), daemon::TypingMode::FinalOnly);
+    }
+}
+
+#[cfg(test)]
+mod models_dir_tests {
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn cwd_models_dir_wins_when_present() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir(tmp.path().join("models")).unwrap();
+        let got = resolve_models_dir(Some(tmp.path().to_path_buf()), None);
+        assert_eq!(got, tmp.path().join("models"));
+    }
+
+    #[test]
+    fn exe_models_dir_used_when_cwd_has_no_models() {
+        let tmp = tempfile::tempdir().unwrap();
+        // CWD exists but has no models/ subdir - must fall through to the exe dir.
+        let cwd = tmp.path().to_path_buf();
+        let exe = tempfile::tempdir().unwrap();
+        fs::create_dir(exe.path().join("models")).unwrap();
+        let got = resolve_models_dir(Some(cwd), Some(exe.path().to_path_buf()));
+        assert_eq!(got, exe.path().join("models"));
+    }
+
+    #[test]
+    fn cwd_models_dir_takes_precedence_over_exe() {
+        let cwd = tempfile::tempdir().unwrap();
+        fs::create_dir(cwd.path().join("models")).unwrap();
+        let exe = tempfile::tempdir().unwrap();
+        fs::create_dir(exe.path().join("models")).unwrap();
+        let got = resolve_models_dir(Some(cwd.path().to_path_buf()), Some(exe.path().to_path_buf()));
+        assert_eq!(got, cwd.path().join("models"));
+    }
+
+    #[test]
+    fn falls_back_to_literal_models_when_neither_exists() {
+        let empty = tempfile::tempdir().unwrap();
+        // CWD present without models/, exe dir missing entirely.
+        let got = resolve_models_dir(Some(empty.path().to_path_buf()), None);
+        assert_eq!(got, PathBuf::from("models"));
+        // Both inputs missing (env read failures) fall back the same way.
+        assert_eq!(resolve_models_dir(None, None), PathBuf::from("models"));
     }
 }
 
