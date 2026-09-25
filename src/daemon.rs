@@ -310,6 +310,15 @@ impl Engine {
     pub async fn start(&mut self) -> Result<()> {
         anyhow::ensure!(!self.is_recording(), "already recording");
 
+        // The VAD is created before the capture thread starts, so a failed
+        // start (e.g. the VAD model file was corrupted after Engine::load)
+        // cannot strand a live capture thread: with self.session still None,
+        // no stop() could ever reach it, and if its process callback never
+        // fires (no capture source was ever scheduled) it would hold the mic
+        // and its PipeWire connection indefinitely. Everything fallible in
+        // start() now happens before the capture exists.
+        let vad = Vad::new(&self.vad_config)?;
+
         let (frames_tx, frames_rx) = mpsc::channel(128);
         let (out_tx, out_rx) = mpsc::channel::<InjectorInput>(16);
         let (exited_tx, exited_rx) = oneshot::channel::<()>();
@@ -321,14 +330,12 @@ impl Engine {
 
         let pipeline = match self.asr.kind() {
             AsrKind::Nemotron | AsrKind::Zipformer => {
-                let vad = Vad::new(&self.vad_config)?;
                 let asr = self.asr.clone();
                 let handle = tokio::spawn(stream_task(vad, asr, frames_rx, out_tx));
                 PipelineTasks::Streaming { stream: handle }
             }
             AsrKind::Moonshine => {
                 let (segs_tx, segs_rx) = mpsc::channel(16);
-                let vad = Vad::new(&self.vad_config)?;
                 // 30s of lookback: covers max segment (20s) + padding comfortably.
                 let ring = AudioRing::new(30 * audio::SAMPLE_RATE as usize);
                 let vad_handle = tokio::spawn(vad_task(vad, ring, frames_rx, segs_tx));
@@ -1769,6 +1776,171 @@ mod tests {
             events_rx.try_recv().is_err(),
             "stopping while idle must not emit events"
         );
+    }
+
+    /// A `start()` that fails after `Engine::load` must leave no capture
+    /// thread behind and leave the engine fully usable: here the VAD model
+    /// is corrupted on disk *after* the load, so the load succeeds but the
+    /// per-start `Vad::new` fails. Because `start()` creates the VAD before
+    /// it starts the capture, the failed start strands nothing - with
+    /// `self.session` still None no `stop()` could ever have reached an
+    /// abandoned capture thread, and one whose process callback never fires
+    /// (no capture source) would hold the mic and its PipeWire connection
+    /// forever. The capture thread is observable as the OS thread named
+    /// "saytype-audio"; all real-model tests serialize under
+    /// `model_lock()`, so the count is deterministic. Model files are
+    /// copied to a temp dir first, so the shared `models/` (and any live
+    /// daemon reading it) is never touched.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn failed_start_leaves_no_capture_thread_and_engine_stays_usable() {
+        let _lock = model_lock();
+        let Some(models) = repo_models_dir() else {
+            return;
+        };
+
+        // Copy the files Engine::load + start() need (VAD + Moonshine dir)
+        // into a temp models dir; the corruption below must never touch the
+        // shared models/ (a live daemon loads the VAD per start()).
+        let tmp = tempfile::tempdir().unwrap();
+        let m = tmp.path();
+        let vad_src = models.join("silero_vad.onnx");
+        if !vad_src.is_file() {
+            return;
+        }
+        std::fs::copy(&vad_src, m.join("silero_vad.onnx")).unwrap();
+        let mut copied_moonshine = false;
+        for entry in std::fs::read_dir(&models).unwrap() {
+            let p = entry.unwrap().path();
+            if p.is_dir()
+                && p.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with("sherpa-onnx-moonshine")
+            {
+                let dst = m.join(p.file_name().unwrap());
+                std::fs::create_dir_all(&dst).unwrap();
+                for f in [
+                    "encoder_model.ort",
+                    "decoder_model_merged.ort",
+                    "tokens.txt",
+                ] {
+                    let src = p.join(f);
+                    if src.is_file() {
+                        std::fs::copy(&src, dst.join(f)).unwrap();
+                    }
+                }
+                copied_moonshine = true;
+            }
+        }
+        if !copied_moonshine {
+            return;
+        }
+
+        // No-op stand-ins for every tool the successful session below
+        // could invoke (the stop-time deferred paste).
+        let tools = tempfile::tempdir().unwrap();
+        let d = tools.path();
+        make_fake_tool(d, "wl-copy", "#!/bin/sh\ncat > /dev/null\n");
+        make_fake_tool(d, "xclip", "#!/bin/sh\ncat > /dev/null\n");
+        make_fake_tool(d, "ydotool", "#!/bin/sh\nexit 0\n");
+        let _env = EnvPatch::new(d, true).await;
+
+        let (events_tx, mut events_rx) = mpsc::unbounded_channel::<EngineEvent>();
+        let mut engine = match Engine::load(
+            m,
+            events_tx,
+            BackendSelection::Moonshine,
+            TypingMode::Deferred,
+        )
+        .await
+        {
+            Ok(e) => e,
+            Err(_) => return,
+        };
+
+        assert_eq!(capture_thread_count(), 0, "no capture thread before start");
+
+        // Corrupt the VAD after the load: start() must fail cleanly, and
+        // because the capture starts only after the VAD is created, a
+        // failed start strands no thread.
+        let vad_copy = m.join("silero_vad.onnx");
+        std::fs::write(&vad_copy, b"not a model").unwrap();
+        let err = engine.start().await.unwrap_err().to_string();
+        assert!(
+            err.contains("corrupt or incomplete"),
+            "expected the corrupt-model error, got: {err}"
+        );
+        assert!(!engine.is_recording());
+
+        // A failed start must not have started the capture thread at all.
+        // Sample for a while rather than counting once: a thread spawned
+        // just before the count may not be registered in /proc/self/task
+        // yet, and a (bug) leaked thread self-heals within ~100 ms once
+        // its next frame send fails - on a system whose capture callback
+        // never fires it would live forever. Sampling the whole window
+        // catches every case the single count could miss.
+        let mut observed = 0;
+        for _ in 0..20 {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            observed = observed.max(capture_thread_count());
+        }
+        assert_eq!(
+            observed, 0,
+            "a failed start must not leave a capture thread behind"
+        );
+
+        // The engine stays usable: recover the model, and a normal
+        // session runs and stops cleanly.
+        std::fs::copy(&vad_src, &vad_copy).unwrap();
+        engine.start().await.expect("start after a failed start");
+        assert!(engine.is_recording());
+        engine.stop().await;
+        assert_eq!(
+            capture_thread_count(),
+            0,
+            "stop must have ended the session's capture thread"
+        );
+        let states: Vec<String> = {
+            let mut evs = Vec::new();
+            while let Ok(ev) = events_rx.try_recv() {
+                evs.push(ev)
+            }
+            evs.into_iter()
+                .filter_map(|ev| match ev {
+                    EngineEvent::StateChanged(s) => Some(s),
+                    _ => None,
+                })
+                .collect()
+        };
+        assert_eq!(
+            states,
+            vec!["Recording".to_string(), "Idle".to_string()],
+            "the post-failure session's state changes must be exactly Recording, then Idle"
+        );
+    }
+
+    /// Count live OS threads named "saytype-audio" (the capture thread);
+    /// 0 on non-Linux (the helper's assertions then trivially hold and the
+    /// test degrades to the error/state checks).
+    fn capture_thread_count() -> usize {
+        let Ok(entries) = std::fs::read_dir("/proc/self/task") else {
+            return 0;
+        };
+        let mut n = 0;
+        for entry in entries.flatten() {
+            let comm = format!(
+                "/proc/self/task/{}/comm",
+                entry.file_name().to_string_lossy()
+            );
+            if std::fs::read_to_string(&comm)
+                .map(|s| s.trim() == "saytype-audio")
+                .unwrap_or(false)
+            {
+                n += 1;
+            }
+        }
+        n
     }
 }
 
