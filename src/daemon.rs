@@ -1079,6 +1079,54 @@ mod tests {
         );
     }
 
+    /// Deferred mode with a mid-dictation undo: the previously untested
+    /// `InjectorInput::Undo` branch in the default typing mode. Erase hides
+    /// the last partial word, undo restores it (HUD only - Deferred types
+    /// nothing until stop), and the restored word still reaches the
+    /// committed final. The session ends fully erased again, so the one-shot
+    /// stop paste stays a no-op and the test is headless-safe.
+    #[tokio::test]
+    async fn deferred_injector_task_undoes_a_partial_erase_before_the_final() {
+        let (out_tx, out_rx) = mpsc::channel::<InjectorInput>(8);
+        let (ev_tx, mut ev_rx) = mpsc::unbounded_channel::<EngineEvent>();
+        let handle = tokio::spawn(injector_task(out_rx, ev_tx, TypingMode::Deferred, true));
+
+        out_tx
+            .send(InjectorInput::Asr(AsrOutput::Partial("hello world".into())))
+            .await
+            .unwrap();
+        out_tx.send(InjectorInput::Erase).await.unwrap();
+        // The restored word must be visible again before the final.
+        out_tx.send(InjectorInput::Undo).await.unwrap();
+        out_tx
+            .send(InjectorInput::Asr(AsrOutput::Final("hello world".into())))
+            .await
+            .unwrap();
+        // Fully erase the committed text so the stop paste is a no-op.
+        out_tx.send(InjectorInput::Erase).await.unwrap();
+        out_tx.send(InjectorInput::Erase).await.unwrap();
+        drop(out_tx);
+        handle.await.unwrap();
+
+        let mut events = Vec::new();
+        while let Ok(ev) = ev_rx.try_recv() {
+            events.push(ev);
+        }
+        assert_eq!(
+            events,
+            vec![
+                EngineEvent::PartialTranscribed("hello world".into()),
+                EngineEvent::TranscriptUpdated("hello world".into()),
+                EngineEvent::TranscriptUpdated("hello".into()),
+                EngineEvent::TranscriptUpdated("hello world".into()),
+                EngineEvent::SegmentTranscribed("hello world".into()),
+                EngineEvent::TranscriptUpdated("Hello world".into()),
+                EngineEvent::TranscriptUpdated("Hello".into()),
+                EngineEvent::TranscriptUpdated(String::new()),
+            ]
+        );
+    }
+
     /// The Live-mode (old mvp2 default) injector task, end to end, against a
     /// faked `ydotool` on a sandboxed PATH: pins the documented typing
     /// behavior - nothing is typed until a partial has survived
