@@ -1182,6 +1182,7 @@ dependencies = [
  "anyhow",
  "pipewire",
  "sherpa-onnx",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",

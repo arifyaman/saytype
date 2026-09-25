@@ -642,3 +642,249 @@ pub fn check_models_dir(models_dir: &Path) -> Result<()> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    /// Create an empty `models/`-like directory (removed on drop).
+    fn models_dir() -> tempfile::TempDir {
+        tempfile::tempdir().expect("tempdir")
+    }
+
+    /// Create a subdirectory of a models dir (removed with the parent on drop).
+    fn sub(models: &Path, name: &str) -> PathBuf {
+        let p = models.join(name);
+        fs::create_dir_all(&p).expect("create sub dir");
+        p
+    }
+
+    /// Create an empty file with the given name in `dir`.
+    fn file(dir: &Path, name: &str) {
+        fs::write(dir.join(name), b"").expect("write file");
+    }
+
+    fn file_name(p: impl AsRef<Path>) -> String {
+        p.as_ref()
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn polish_without_punct_model_normalizes() {
+        // Empty and whitespace-only input.
+        assert_eq!(polish(None, ""), "");
+        assert_eq!(polish(None, "   \t\n  "), "");
+        // Lowercased, surrounding whitespace trimmed, punctuation stripped.
+        assert_eq!(polish(None, "  Hello, World!  "), "hello world");
+        assert_eq!(polish(None, "STOP; GO: NOW."), "stop go now");
+        // Punctuation-only input collapses to nothing.
+        assert_eq!(polish(None, "?!...;:"), "");
+        // Inner whitespace runs are preserved as-is (single spaces here).
+        assert_eq!(polish(None, "a, b"), "a b");
+    }
+
+    #[test]
+    fn find_model_matches_stem_and_model_extension() {
+        let models = models_dir();
+        let d = sub(models.path(), "m");
+        file(&d, "encoder_model.onnx");
+        file(&d, "decoder_model.ort");
+        file(&d, "encoder_model.txt"); // wrong extension: ignored
+
+        assert_eq!(
+            find_model(&d, "encoder_model").as_ref().map(file_name),
+            Some("encoder_model.onnx".to_string())
+        );
+        // Stem must be contained in the name.
+        assert!(find_model(&d, "decoder").is_some());
+        assert!(find_model(&d, "joiner").is_none());
+
+        // Non-existent and empty dirs yield None, not an error.
+        assert!(find_model(&models.path().join("no-such-dir"), "encoder_model").is_none());
+        assert!(find_model(models.path(), "encoder_model").is_none());
+    }
+
+    #[test]
+    fn find_zipformer_onnx_requires_epoch_and_prefers_non_int8() {
+        let models = models_dir();
+        let d = sub(models.path(), "z");
+        file(&d, "encoder-epoch-99.int8.onnx");
+        // Only int8 present: it is used.
+        assert_eq!(
+            find_zipformer_onnx(&d, "encoder").as_ref().map(file_name),
+            Some("encoder-epoch-99.int8.onnx".to_string())
+        );
+        // Both present: the non-int8 one wins.
+        file(&d, "encoder-epoch-99.onnx");
+        assert_eq!(
+            find_zipformer_onnx(&d, "encoder").as_ref().map(file_name),
+            Some("encoder-epoch-99.onnx".to_string())
+        );
+
+        // Files without "epoch" in the name do not match the zipformer layout.
+        let d2 = sub(models.path(), "z2");
+        file(&d2, "encoder.onnx");
+        assert!(find_zipformer_onnx(&d2, "encoder").is_none());
+    }
+
+    #[test]
+    fn find_onnx_preferring_int8_prefers_int8() {
+        let models = models_dir();
+        let d = sub(models.path(), "n");
+        file(&d, "encoder.onnx");
+        assert_eq!(
+            find_onnx_preferring_int8(&d, "encoder").as_ref().map(file_name),
+            Some("encoder.onnx".to_string())
+        );
+        file(&d, "encoder.int8.onnx");
+        assert_eq!(
+            find_onnx_preferring_int8(&d, "encoder").as_ref().map(file_name),
+            Some("encoder.int8.onnx".to_string())
+        );
+
+        // No match (incl. wrong extension) -> None.
+        let d2 = sub(models.path(), "n2");
+        file(&d2, "encoder.txt");
+        assert!(find_onnx_preferring_int8(&d2, "encoder").is_none());
+        assert!(find_onnx_preferring_int8(&d2, "joiner").is_none());
+    }
+
+    #[test]
+    fn find_moonshine_skips_incomplete_dirs_and_checks_all_parts() {
+        let models = models_dir();
+        // Sorted first, but missing tokens.txt: must be skipped.
+        let broken = sub(models.path(), "sherpa-onnx-moonshine-16k-v1-broken");
+        file(&broken, "encoder_model.onnx");
+        file(&broken, "decoder_model_merged.onnx");
+        assert!(Asr::find_moonshine(models.path()).is_none());
+
+        // Complete dir (sorted after the broken one) is found.
+        let ok = sub(models.path(), "sherpa-onnx-moonshine-16k-v2");
+        file(&ok, "encoder_model.ort");
+        file(&ok, "decoder_model_merged.ort");
+        file(&ok, "tokens.txt");
+        let p = Asr::find_moonshine(models.path()).expect("complete dir found");
+        assert!(p.dir.ends_with("sherpa-onnx-moonshine-16k-v2"));
+        assert_eq!(file_name(p.encoder), "encoder_model.ort");
+        assert_eq!(file_name(p.merged_decoder), "decoder_model_merged.ort");
+        assert!(p.tokens.ends_with("tokens.txt"));
+
+        // A stray top-level file (e.g. silero_vad.onnx) is never a candidate.
+        file(models.path(), "silero_vad.onnx");
+        assert!(Asr::find_moonshine(models.path()).is_some());
+    }
+
+    #[test]
+    fn find_online_punct_prefers_int8_and_requires_vocab() {
+        let models = models_dir();
+        let d = sub(models.path(), "sherpa-onnx-online-punct-en");
+        file(&d, "bpe.vocab");
+        file(&d, "model.onnx");
+        let p = Asr::find_online_punct(models.path()).expect("fp32 model found");
+        assert_eq!(file_name(p.model), "model.onnx");
+        // int8 appears and takes priority.
+        file(&d, "model.int8.onnx");
+        let p = Asr::find_online_punct(models.path()).expect("int8 model found");
+        assert_eq!(file_name(p.model), "model.int8.onnx");
+        assert_eq!(file_name(p.vocab), "bpe.vocab");
+
+        // Missing vocab disqualifies a dir; wrong dir prefix is ignored.
+        let d2 = sub(models.path(), "sherpa-onnx-online-punct-en2");
+        file(&d2, "model.int8.onnx");
+        let d3 = sub(models.path(), "punct-model");
+        file(&d3, "bpe.vocab");
+        file(&d3, "model.int8.onnx");
+        let p = Asr::find_online_punct(models.path()).expect("first good dir still wins");
+        assert!(p.dir.ends_with("sherpa-onnx-online-punct-en"));
+
+        let models2 = models_dir();
+        let only = sub(models2.path(), "sherpa-onnx-online-punct-en");
+        file(&only, "model.int8.onnx");
+        assert!(Asr::find_online_punct(models2.path()).is_none());
+    }
+
+    #[test]
+    fn find_nemotron_requires_triple_and_tokens() {
+        let models = models_dir();
+        // Sorted first but missing the joiner: skipped.
+        let broken = sub(models.path(), "sherpa-onnx-nemotron-speech-streaming-en-0.6b-broken");
+        file(&broken, "encoder.int8.onnx");
+        file(&broken, "decoder.int8.onnx");
+        file(&broken, "tokens.txt");
+        assert!(Asr::find_nemotron(models.path()).is_none());
+
+        // Complete dir is found and the int8 variants are picked.
+        let ok = sub(models.path(), "sherpa-onnx-nemotron-speech-streaming-en-0.6b");
+        file(&ok, "encoder.onnx");
+        file(&ok, "encoder.int8.onnx");
+        file(&ok, "decoder.int8.onnx");
+        file(&ok, "joiner.int8.onnx");
+        file(&ok, "tokens.txt");
+        let p = Asr::find_nemotron(models.path()).expect("complete dir found");
+        assert!(p.dir.ends_with("sherpa-onnx-nemotron-speech-streaming-en-0.6b"));
+        assert_eq!(file_name(p.encoder), "encoder.int8.onnx");
+        assert_eq!(file_name(p.decoder), "decoder.int8.onnx");
+        assert_eq!(file_name(p.joiner), "joiner.int8.onnx");
+
+        // A non-matching dir prefix is never a candidate.
+        let models2 = models_dir();
+        let other = sub(models2.path(), "my-nemotron-copy");
+        file(&other, "encoder.int8.onnx");
+        file(&other, "decoder.int8.onnx");
+        file(&other, "joiner.int8.onnx");
+        file(&other, "tokens.txt");
+        assert!(Asr::find_nemotron(models2.path()).is_none());
+    }
+
+    #[test]
+    fn resolve_zipformer_paths_ok_and_error() {
+        let models = models_dir();
+        // No matching dir at all: Err with a helpful message.
+        let err = Asr::resolve_zipformer_paths(models.path()).err().expect("error expected").to_string();
+        assert!(err.contains("no ASR model found"), "unexpected error: {err}");
+
+        // Complete dir resolves with the epoch-tagged files.
+        let ok = sub(
+            models.path(),
+            "sherpa-onnx-streaming-zipformer-bilingual-zh-en-2023-02-20",
+        );
+        file(&ok, "encoder-epoch-99-avg-1.onnx");
+        file(&ok, "decoder-epoch-99-avg-1.onnx");
+        file(&ok, "joiner-epoch-99-avg-1.onnx");
+        file(&ok, "tokens.txt");
+        let p = Asr::resolve_zipformer_paths(models.path()).expect("complete dir resolves");
+        assert!(p.dir.ends_with("sherpa-onnx-streaming-zipformer-bilingual-zh-en-2023-02-20"));
+        assert_eq!(file_name(p.encoder), "encoder-epoch-99-avg-1.onnx");
+        assert_eq!(file_name(p.decoder), "decoder-epoch-99-avg-1.onnx");
+        assert_eq!(file_name(p.joiner), "joiner-epoch-99-avg-1.onnx");
+        assert!(p.tokens.ends_with("tokens.txt"));
+    }
+
+    #[test]
+    fn asr_new_without_models_errors_for_every_selection() {
+        let models = models_dir();
+        // Auto walks the whole fallback chain (nemotron -> zipformer ->
+        // moonshine) and only then reports failure.
+        for selection in [
+            BackendSelection::Auto,
+            BackendSelection::Streaming,
+            BackendSelection::Zipformer,
+            BackendSelection::Moonshine,
+        ] {
+            let err = Asr::new(models.path(), 1, selection).err().expect("error expected").to_string();
+            assert!(!err.is_empty(), "{selection:?} should error on an empty models dir");
+        }
+    }
+
+    #[test]
+    fn check_models_dir_reports_missing_dir() {
+        let models = models_dir();
+        let missing = models.path().join("no-such-dir");
+        let err = check_models_dir(&missing).unwrap_err().to_string();
+        assert!(err.contains("no-such-dir"), "unexpected error: {err}");
+        assert!(check_models_dir(models.path()).is_ok());
+    }
+}

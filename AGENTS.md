@@ -78,7 +78,7 @@ Pipeline per dictation session:
 | `src/daemon.rs` | D-Bus service (`Toggle`/`Stop`/`EraseWord`/`UndoErase` + signals), `Engine` state machine (Idle/Recording), per-session pipeline: `stream_task` (streaming) or `vad_task`+`asr_task` (batch), `injector_task` (owns the session's `Transcript`, applies erase/undo, emits `TranscriptUpdated`); `EngineEvent`/`AsrOutput`/`InjectorInput` |
 | `src/audio.rs` | PipeWire capture on a dedicated OS thread; S16LE 16 kHz mono in, f32 frames out via mpsc |
 | `src/vad.rs` | Silero VAD wrapper, `detected()` in-progress probe, `VadParams` defaults, `AudioRing` context-padding buffer (batch path) + unit tests |
-| `src/asr.rs` | `Asr` tri-backend (Nemotron streaming `OnlineRecognizer` preferred, Zipformer `OnlineRecognizer` fallback, Moonshine `OfflineRecognizer` batch), `BackendSelection`/`AsrKind`, `StreamingSession` (feed/partial/commit), batch `transcribe()`, `polish()` (lowercase + strip punct + online punct) output policy, optional `OnlinePunctuation` model auto-detect |
+| `src/asr.rs` | `Asr` tri-backend (Nemotron streaming `OnlineRecognizer` preferred, Zipformer `OnlineRecognizer` fallback, Moonshine `OfflineRecognizer` batch), `BackendSelection`/`AsrKind`, `StreamingSession` (feed/partial/commit), batch `transcribe()`, `polish()` (lowercase + strip punct + online punct) output policy, optional `OnlinePunctuation` model auto-detect, + unit tests for the model-dir detection helpers (`find_moonshine`/`find_nemotron`/`resolve_zipformer_paths`/`find_online_punct` + filename matching/preference rules) and `polish()` |
 | `src/injector.rs` | ydotool typing (`type_text`, `backspaces`), `diff` prefix-diff, `capitalize_first` MVP punctuation stand-in + tests |
 | `src/transcript.rs` | Pure `Transcript` state machine: single source of truth for the visible text (committed finals + live partial) with mid-dictation word erase/undo. Committed text is a token-slot sequence (permanently erased words are gaps, pending erasures hide a slot) so a restored word returns to its original position; partial erasures track token positions across decoder revisions and stay restorable for the whole utterance in progress regardless of how much the live hypothesis grows tick to tick, becoming permanent only at a genuine utterance boundary (this utterance's final showing content no partial ever did, or the next utterance's first partial); first visible word per segment is capitalized at render time; `display()` (HUD) + `buffer_target()` (target buffer) + unit tests |
 | `extension/saytype@saytype.local/` | GNOME Shell extension HUD (gjs, ESM-first): D-Bus proxy client, pointer-following word-wrapping pill + dim overlay (inline St styles, symbolic mic icon) rendering the authoritative `TranscriptUpdated` in full (no truncation); while recording, global Left/Right arrow-key keybindings (added/removed with the session) drive erase/undo (`EraseWord`/`UndoErase`); `metadata.json`, `schemas/org.gnome.shell.extensions.saytype.gschema.xml` |
@@ -239,7 +239,7 @@ pipeline (final `SegmentTranscribed`) **before** emitting
 
 ```sh
 cargo build --release        # release binary at target/release/saytype
-cargo test                   # unit tests (AudioRing, capitalize_first)
+cargo test                   # unit tests (transcript, injector, VAD AudioRing, ASR model detection + polish, daemon stable-target logic, config)
 cargo run                    # run the daemon manually (needs models/ + session bus)
 
 scripts/install-user-service.sh   # build + install + enable the user service

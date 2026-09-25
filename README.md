@@ -109,7 +109,7 @@ Canary, SenseVoice, ...) are not picked up today.
 
 ```sh
 cargo build --release        # binary at target/release/saytype
-cargo test                   # unit tests (AudioRing, capitalize_first)
+cargo test                   # unit tests (transcript, injector, VAD AudioRing, ASR model detection + polish, daemon stable-target logic, config)
 cargo run                    # run the daemon manually (needs models/ + session bus)
 journalctl --user -u saytype -f
 gdbus monitor --session --dest io.saytype.Dictate --object-path /io/saytype/Dictate
