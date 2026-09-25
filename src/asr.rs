@@ -92,13 +92,20 @@ impl Asr {
         // mvp2 default: streaming first (it alone can produce live
         // partials); Nemotron is preferred over Zipformer; Moonshine stays
         // as the batch fallback.
+        // A discovered-but-corrupt model is a hard error in every mode:
+        // silently falling back would hide the broken download from the
+        // user (a *missing* model is the legitimate fallback condition).
+        let is_corrupt =
+            |e: &anyhow::Error| e.downcast_ref::<crate::onnx::CorruptModel>().is_some();
         let backend = match selection {
             BackendSelection::Auto => match Self::create_nemotron(models_dir, num_threads) {
                 Ok(b) => b,
+                Err(e) if is_corrupt(&e) => return Err(e),
                 Err(e) => {
                     tracing::info!("no usable Nemotron streaming model ({e}); trying Zipformer");
                     match Self::create_zipformer(models_dir, num_threads) {
                         Ok(b) => b,
+                        Err(e2) if is_corrupt(&e2) => return Err(e2),
                         Err(e2) => {
                             tracing::info!(
                                 "no usable streaming Zipformer model ({e2}); trying Moonshine"
@@ -110,6 +117,7 @@ impl Asr {
             },
             BackendSelection::Streaming => match Self::create_nemotron(models_dir, num_threads) {
                 Ok(b) => b,
+                Err(e) if is_corrupt(&e) => return Err(e),
                 Err(e) => {
                     tracing::info!(
                         "no usable Nemotron streaming model ({e}); falling back to Zipformer"
@@ -168,6 +176,17 @@ impl Asr {
             format!("no Moonshine model found under {:?} (a sherpa-onnx-moonshine-* dir with encoder_model.*, decoder_model_merged.*, tokens.txt)", models_dir)
         })?;
         tracing::info!("ASR backend: moonshine v2 in {:?}", paths.dir);
+        // .onnx files get the corrupt-model guard (a corrupt .ort file is
+        // still possible but ORT's binary format has no cheap envelope
+        // check; the default install uses the Nemotron .onnx stack).
+        for (path, what) in [
+            (&paths.encoder, "Moonshine encoder"),
+            (&paths.merged_decoder, "Moonshine merged decoder"),
+        ] {
+            if path.ends_with(".onnx") {
+                crate::onnx::check_onnx_file(Path::new(path), what)?;
+            }
+        }
         let mut config = OfflineRecognizerConfig::default();
         config.model_config.moonshine.encoder = Some(paths.encoder);
         config.model_config.moonshine.merged_decoder = Some(paths.merged_decoder);
@@ -187,6 +206,13 @@ impl Asr {
             "ASR backend: nemotron speech streaming (en 0.6b) in {:?}",
             paths.dir
         );
+        for (path, what) in [
+            (&paths.encoder, "Nemotron encoder"),
+            (&paths.decoder, "Nemotron decoder"),
+            (&paths.joiner, "Nemotron joiner"),
+        ] {
+            crate::onnx::check_onnx_file(Path::new(path), what)?;
+        }
         let mut config = OnlineRecognizerConfig::default();
         config.model_config.transducer.encoder = Some(paths.encoder);
         config.model_config.transducer.decoder = Some(paths.decoder);
@@ -208,6 +234,13 @@ impl Asr {
     fn create_zipformer(models_dir: &Path, num_threads: i32) -> Result<Backend> {
         let paths = Self::resolve_zipformer_paths(models_dir)?;
         tracing::info!("ASR backend: streaming zipformer in {:?}", paths.dir);
+        for (path, what) in [
+            (&paths.encoder, "Zipformer encoder"),
+            (&paths.decoder, "Zipformer decoder"),
+            (&paths.joiner, "Zipformer joiner"),
+        ] {
+            crate::onnx::check_onnx_file(Path::new(path), what)?;
+        }
         let mut config = OnlineRecognizerConfig::default();
         config.model_config.transducer.encoder = Some(paths.encoder);
         config.model_config.transducer.decoder = Some(paths.decoder);
@@ -246,6 +279,14 @@ impl Asr {
                 "fp32"
             }
         );
+        // The punct model is optional: a corrupt one degrades to no
+        // punctuation (a warning) instead of failing the whole load.
+        if let Err(e) =
+            crate::onnx::check_onnx_file(Path::new(&paths.model), "online punctuation model")
+        {
+            tracing::warn!("online punctuation model unusable: {e}");
+            return None;
+        }
         let config = OnlinePunctuationConfig {
             model: OnlinePunctuationModelConfig {
                 cnn_bilstm: Some(paths.model),
@@ -1186,5 +1227,114 @@ mod tests {
         let err = check_models_dir(&missing).unwrap_err().to_string();
         assert!(err.contains("no-such-dir"), "unexpected error: {err}");
         assert!(check_models_dir(models.path()).is_ok());
+    }
+
+    // --- corrupt model files: clean error, never a process abort ---
+    //
+    // A corrupt model (interrupted download, disk full) used to make the
+    // sherpa-onnx C++ loader throw a C++ exception across the FFI
+    // boundary, which aborts the whole process (SIGABRT, uncatchable in
+    // Rust). The onnx envelope check must reject it with a clean Err.
+
+    /// Write a garbage Nemotron triple into a temp models dir.
+    fn corrupt_nemotron_dir(models: &Path) -> PathBuf {
+        let d = models.join("sherpa-onnx-nemotron-speech-streaming-en-corrupt");
+        std::fs::create_dir_all(&d).unwrap();
+        for name in ["encoder", "decoder", "joiner"] {
+            std::fs::write(d.join(format!("{name}.int8.onnx")), vec![0xAB; 4096]).unwrap();
+        }
+        std::fs::write(d.join("tokens.txt"), "a\nb\n").unwrap();
+        d
+    }
+
+    #[test]
+    fn asr_new_with_corrupt_nemotron_model_errors_cleanly() {
+        let models = models_dir();
+        corrupt_nemotron_dir(models.path());
+        let err = Asr::new(models.path(), 1, BackendSelection::Streaming)
+            .err()
+            .expect("error expected")
+            .to_string();
+        assert!(
+            err.contains("not a valid ONNX model"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            err.contains("download-models.sh"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn asr_new_with_truncated_real_nemotron_model_errors_cleanly() {
+        // An interrupted download of the real model: a file that starts
+        // like a valid ONNX model but ends mid-way. Gated on the real
+        // model being installed.
+        let Some(models) = repo_models_dir() else {
+            return;
+        };
+        let real =
+            models.join("sherpa-onnx-nemotron-speech-streaming-en-0.6b-560ms-int8-2026-04-25");
+        let enc = real.join("encoder.int8.onnx");
+        if !enc.is_file() {
+            return;
+        }
+        let bytes = std::fs::read(&enc).unwrap();
+        let tmp = models_dir();
+        let d = corrupt_nemotron_dir(tmp.path());
+        std::fs::write(d.join("encoder.int8.onnx"), &bytes[..bytes.len() / 10]).unwrap();
+        let err = Asr::new(tmp.path(), 1, BackendSelection::Streaming)
+            .err()
+            .expect("error expected")
+            .to_string();
+        assert!(
+            err.contains("not a valid ONNX model"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn asr_new_with_corrupt_moonshine_onnx_model_errors_cleanly() {
+        let models = models_dir();
+        let d = models.path().join("sherpa-onnx-moonshine-corrupt");
+        std::fs::create_dir_all(&d).unwrap();
+        // .onnx moonshine files get the envelope guard.
+        std::fs::write(d.join("encoder_model.onnx"), vec![0xAB; 4096]).unwrap();
+        std::fs::write(d.join("decoder_model_merged.onnx"), vec![0xAB; 4096]).unwrap();
+        std::fs::write(d.join("tokens.txt"), "a\nb\n").unwrap();
+        let err = Asr::new(models.path(), 1, BackendSelection::Moonshine)
+            .err()
+            .expect("error expected")
+            .to_string();
+        assert!(
+            err.contains("not a valid ONNX model"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn asr_new_with_corrupt_punct_model_degrades_to_no_punct() {
+        // The punct model is optional: a corrupt one must not fail the
+        // whole load - the streaming backend still comes up (with
+        // unpunctuated output). Gated on the real Nemotron model; the
+        // temp dir symlinks it in so the real models/ is untouched.
+        let _lock = model_lock();
+        let Some(models) = repo_models_dir() else {
+            return;
+        };
+        let real =
+            models.join("sherpa-onnx-nemotron-speech-streaming-en-0.6b-560ms-int8-2026-04-25");
+        if !real.is_dir() {
+            return;
+        }
+        let tmp = models_dir();
+        let d = tmp.path();
+        std::os::unix::fs::symlink(&real, d.join(real.file_name().unwrap())).unwrap();
+        let punct = d.join("sherpa-onnx-online-punct-corrupt");
+        std::fs::create_dir_all(&punct).unwrap();
+        std::fs::write(punct.join("model.int8.onnx"), vec![0xAB; 4096]).unwrap();
+        std::fs::write(punct.join("bpe.vocab"), "a\n").unwrap();
+        let asr = Asr::new(d, 1, BackendSelection::Streaming).expect("load");
+        assert_eq!(asr.kind(), AsrKind::Nemotron);
     }
 }

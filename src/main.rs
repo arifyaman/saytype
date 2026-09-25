@@ -2,6 +2,7 @@ mod asr;
 mod audio;
 mod daemon;
 mod injector;
+mod onnx;
 mod transcript;
 mod vad;
 

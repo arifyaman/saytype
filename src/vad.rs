@@ -107,6 +107,9 @@ pub struct Vad {
 
 impl Vad {
     pub fn new(config: &VadConfig) -> Result<Self> {
+        // A corrupt model would make the C++ loader throw across the FFI
+        // boundary and abort the whole process; reject it cleanly instead.
+        crate::onnx::check_onnx_file(Path::new(&config.model_path), "VAD model")?;
         let vad_config = VadModelConfig {
             silero_vad: SileroVadModelConfig {
                 model: Some(config.model_path.clone()),
@@ -163,7 +166,7 @@ pub fn check_model_file(path: &Path) -> Result<()> {
             path
         );
     }
-    Ok(())
+    crate::onnx::check_onnx_file(path, "VAD model")
 }
 
 #[cfg(test)]
@@ -346,8 +349,39 @@ mod tests {
     fn check_model_file_accepts_existing_file() {
         let dir = tempfile::tempdir().expect("tempdir");
         let p = dir.path().join("silero_vad.onnx");
-        std::fs::write(&p, b"").expect("write placeholder");
+        // A structurally valid ONNX envelope: field 1 (ir_version) varint.
+        std::fs::write(&p, [0x08, 0x03]).expect("write placeholder");
         assert!(check_model_file(&p).is_ok());
+    }
+
+    #[test]
+    fn check_model_file_rejects_corrupt_file() {
+        // A corrupt (garbage) model file must be reported with an
+        // actionable re-download hint, not just accepted as "exists".
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = dir.path().join("silero_vad.onnx");
+        std::fs::write(&p, vec![0xAB; 1000]).expect("write garbage");
+        let err = check_model_file(&p).unwrap_err().to_string();
+        assert!(err.contains("not a valid ONNX model"), "{err}");
+        assert!(err.contains("download-models.sh"), "{err}");
+    }
+
+    #[test]
+    fn check_model_file_rejects_truncated_real_model() {
+        let Some(models) = crate::testutil::repo_models_dir() else {
+            return; // models/ not installed
+        };
+        let silero = models.join("silero_vad.onnx");
+        if !silero.is_file() {
+            return;
+        }
+        let bytes = std::fs::read(&silero).unwrap();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = dir.path().join("silero_vad.onnx");
+        // An interrupted download (10% of the real file).
+        std::fs::write(&p, &bytes[..bytes.len() / 10]).expect("write");
+        let err = check_model_file(&p).unwrap_err().to_string();
+        assert!(err.contains("not a valid ONNX model"), "{err}");
     }
 
     #[test]
@@ -363,8 +397,28 @@ mod tests {
         .err()
         .expect("error expected")
         .to_string();
+        assert!(err.contains("VAD model"), "unexpected error: {err}");
+        assert!(err.contains("silero_vad.onnx"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn vad_new_with_corrupt_model_errors_cleanly() {
+        // Regression: a corrupt model file used to make the C++ loader
+        // throw a C++ exception across the FFI boundary, aborting the
+        // whole process (SIGABRT, uncatchable in Rust). It must now be a
+        // clean Err - the daemon stays up and reports the re-download.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = dir.path().join("silero_vad.onnx");
+        std::fs::write(&p, vec![0xAB; 100_000]).expect("write garbage");
+        let err = Vad::new(&VadConfig {
+            model_path: p.to_str().unwrap().to_string(),
+            params: VadParams::default(),
+        })
+        .err()
+        .expect("error expected")
+        .to_string();
         assert!(
-            err.contains("failed to create VAD"),
+            err.contains("not a valid ONNX model"),
             "unexpected error: {err}"
         );
     }
