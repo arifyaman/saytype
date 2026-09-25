@@ -105,12 +105,19 @@ pub async fn paste_text(text: &str) -> io::Result<()> {
 /// work.
 async fn copy_to_clipboard(text: &str) -> io::Result<()> {
     let wayland = std::env::var_os("WAYLAND_DISPLAY").is_some();
-    let attempts: [(&str, &[&str]); 2] = if wayland {
+    try_clipboard_tools(text, &clipboard_attempts(wayland)).await
+}
+
+/// The clipboard tools to try, in order, for one session type: the tool
+/// matching the session first (wl-copy under Wayland, xclip under X11),
+/// the other as the fallback. xclip always needs `-selection clipboard`
+/// (its default selection is PRIMARY, which would not paste on Ctrl+V).
+fn clipboard_attempts(wayland: bool) -> [(&'static str, &'static [&'static str]); 2] {
+    if wayland {
         [("wl-copy", &[]), ("xclip", &["-selection", "clipboard"])]
     } else {
         [("xclip", &["-selection", "clipboard"]), ("wl-copy", &[])]
-    };
-    try_clipboard_tools(text, &attempts).await
+    }
 }
 
 /// Pipe `text` into each `(command, args)` in order; the first tool that
@@ -427,5 +434,128 @@ mod tests {
         .await
         .unwrap_err();
         assert!(err.to_string().contains("second-fail"), "{err}");
+    }
+
+    /// Serializes the tests that temporarily rewrite process-global env
+    /// (PATH / WAYLAND_DISPLAY). They must not overlap each other; the
+    /// absolute-path clipboard tests above are unaffected, because no other
+    /// test spawns a bare command name, so a sandboxed PATH cannot leak
+    /// into them.
+    static PASTE_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// Temporarily put `dir` first on PATH (process-global) and set or
+    /// clear WAYLAND_DISPLAY; both are restored on drop. Prepending (not
+    /// replacing) keeps the fake tools' own `cat` resolvable, while any
+    /// bare name the paste pipeline spawns still resolves to the fake in
+    /// `dir` first, regardless of what the machine has installed.
+    struct EnvPatch {
+        old_path: String,
+        old_wayland: Option<std::ffi::OsString>,
+    }
+
+    impl EnvPatch {
+        fn new(dir: &std::path::Path, wayland: bool) -> Self {
+            let old_path = std::env::var("PATH").unwrap_or_default();
+            let old_wayland = std::env::var_os("WAYLAND_DISPLAY");
+            std::env::set_var(
+                "PATH",
+                format!("{}:{}", dir.display(), old_path),
+            );
+            if wayland {
+                std::env::set_var("WAYLAND_DISPLAY", "wayland-0");
+            } else {
+                std::env::remove_var("WAYLAND_DISPLAY");
+            }
+            Self { old_path, old_wayland }
+        }
+    }
+
+    impl Drop for EnvPatch {
+        fn drop(&mut self) {
+            std::env::set_var("PATH", self.old_path.clone());
+            match &self.old_wayland {
+                Some(v) => std::env::set_var("WAYLAND_DISPLAY", v),
+                None => std::env::remove_var("WAYLAND_DISPLAY"),
+            }
+        }
+    }
+
+    #[test]
+    fn clipboard_attempts_orders_the_session_tool_first() {
+        let wayland = clipboard_attempts(true);
+        assert_eq!(wayland[0].0, "wl-copy");
+        assert!(wayland[0].1.is_empty());
+        assert_eq!(wayland[1].0, "xclip");
+        assert_eq!(wayland[1].1, ["-selection", "clipboard"]);
+        let x11 = clipboard_attempts(false);
+        assert_eq!(x11[0].0, "xclip");
+        assert_eq!(x11[0].1, ["-selection", "clipboard"]);
+        assert_eq!(x11[1].0, "wl-copy");
+        assert!(x11[1].1.is_empty());
+    }
+
+    /// The Deferred-mode one-shot paste, end to end, on a Wayland session:
+    /// wl-copy (the session tool) receives the whole text, the xclip
+    /// fallback is never tried, and then - and only then - exactly
+    /// `ydotool key ctrl+v` is sent.
+    #[tokio::test]
+    async fn paste_text_copies_via_wl_copy_then_pastes_under_wayland() {
+        let _guard = PASTE_TEST_LOCK.lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
+        make_fake_tool(d, "wl-copy", &format!("#!/bin/sh\ncat > {}\n", d.join("wl-copy.log").display()));
+        make_fake_tool(
+            d,
+            "xclip",
+            &format!("#!/bin/sh\nprintf '%s ' \"$@\" > {}\ncat > {}\n", d.join("xclip.args").display(), d.join("xclip.log").display()),
+        );
+        make_fake_tool(d, "ydotool", &format!("#!/bin/sh\nprintf '%s\\n' \"$@\" > {}\n", d.join("ydotool.log").display()));
+        let _env = EnvPatch::new(d, true);
+        paste_text("hello world").await.unwrap();
+        assert_eq!(std::fs::read_to_string(d.join("wl-copy.log")).unwrap(), "hello world");
+        assert!(!d.join("xclip.log").exists());
+        assert_eq!(std::fs::read_to_string(d.join("ydotool.log")).unwrap(), "key\nctrl+v\n");
+    }
+
+    /// The same pipeline on an X11 session: xclip is tried first and must
+    /// be given `-selection clipboard` (xclip's default selection is
+    /// PRIMARY, which Ctrl+V would not paste); wl-copy is only the
+    /// fallback.
+    #[tokio::test]
+    async fn paste_text_prefers_xclip_under_x11_and_passes_selection_arg() {
+        let _guard = PASTE_TEST_LOCK.lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
+        make_fake_tool(d, "wl-copy", &format!("#!/bin/sh\ncat > {}\n", d.join("wl-copy.log").display()));
+        make_fake_tool(
+            d,
+            "xclip",
+            &format!("#!/bin/sh\nprintf '%s ' \"$@\" > {}\ncat > {}\n", d.join("xclip.args").display(), d.join("xclip.log").display()),
+        );
+        make_fake_tool(d, "ydotool", &format!("#!/bin/sh\nprintf '%s\\n' \"$@\" > {}\n", d.join("ydotool.log").display()));
+        let _env = EnvPatch::new(d, false);
+        paste_text("hi there").await.unwrap();
+        assert_eq!(std::fs::read_to_string(d.join("xclip.log")).unwrap(), "hi there");
+        assert_eq!(std::fs::read_to_string(d.join("xclip.args")).unwrap(), "-selection clipboard ");
+        assert!(!d.join("wl-copy.log").exists());
+        assert_eq!(std::fs::read_to_string(d.join("ydotool.log")).unwrap(), "key\nctrl+v\n");
+    }
+
+    /// Safety property: if the clipboard cannot be set (both tools fail),
+    /// the paste keystroke must NOT be sent - a bare Ctrl+V would paste
+    /// whatever stale text the clipboard already held.
+    #[tokio::test]
+    async fn paste_text_does_not_send_paste_keystroke_when_clipboard_fails() {
+        let _guard = PASTE_TEST_LOCK.lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
+        make_fake_tool(d, "wl-copy", "#!/bin/sh\necho clip-fail >&2\nexit 1\n");
+        make_fake_tool(d, "xclip", "#!/bin/sh\necho xclip-fail >&2\nexit 1\n");
+        make_fake_tool(d, "ydotool", &format!("#!/bin/sh\nprintf '%s\\n' \"$@\" > {}\n", d.join("ydotool.log").display()));
+        let _env = EnvPatch::new(d, true);
+        // Both attempts fail: the error is the last one tried (xclip).
+        let err = paste_text("x").await.unwrap_err();
+        assert!(err.to_string().contains("xclip-fail"), "{err}");
+        assert!(!d.join("ydotool.log").exists());
     }
 }
